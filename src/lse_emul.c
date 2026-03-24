@@ -392,26 +392,37 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 		return n;
 	}
 
-	/* Normal case: Rt != XZR, load_reg == Rt */
-	/* stxr w_tmp, tmp, [Rn] — but stxr status must != Rn and != value.
-	 * tmp is the value, and tmp != Rn (guaranteed by pick_scratch).
-	 * Use a sub-word of a register for status... actually stlxr Ws
-	 * uses the W view. We can reuse tmp for status IF we do stxr BEFORE
-	 * we need tmp's value. But we just computed into tmp and need to store it.
+	/* Normal case: Rt != XZR, load_reg == Rt.
 	 *
-	 * Problem: stxr W_status, X_value, [Xn] requires status != value register.
-	 * We need a second scratch just for the 1-bit status.
+	 * We need two scratch registers:
+	 *   tmp:    holds the computed new value for stxr
+	 *   status: holds the stxr success/fail result
 	 *
-	 * Simplest: pick a second scratch, save/restore it too. */
+	 * When Rt == Rn, ldxr clobbers the address register with the loaded
+	 * value. We need a third scratch to preserve the address. */
 	int status = pick_scratch(tmp, d->rt, d->rn);
 
-	/* Restart with double save */
+	/* addr_reg: register holding the address for ldxr/stxr.
+	 * Normally Rn, but if Rt==Rn we copy Rn to a scratch first. */
+	int addr_reg = d->rn;
+	int addr_scratch = -1;
+	if (d->rt == d->rn && !rt_is_zr) {
+		/* Need a third scratch for the address */
+		addr_scratch = pick_scratch(tmp, status, d->rs);
+		addr_reg = addr_scratch;
+	}
+
+	/* Restart with saves */
 	n = 0;
 	island[n++] = enc_str_pre(tmp);
 	island[n++] = enc_str_pre(status);
+	if (addr_scratch >= 0) {
+		island[n++] = enc_str_pre(addr_scratch);
+		island[n++] = enc_mov(1, addr_scratch, d->rn);  /* copy address */
+	}
 
 	loop_start = n;
-	island[n++] = enc_ldxr(d->size, d->acquire, load_reg, d->rn);
+	island[n++] = enc_ldxr(d->size, d->acquire, load_reg, addr_reg);
 
 	switch (d->op) {
 	case LSE_LDADD:
@@ -449,8 +460,10 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 		break;
 	}
 
-	island[n++] = enc_stxr(d->size, d->release, status, tmp, d->rn);
+	island[n++] = enc_stxr(d->size, d->release, status, tmp, addr_reg);
 	{ int off = loop_start - (n + 1); island[n] = enc_cbnz_w(status, off); n++; }
+	if (addr_scratch >= 0)
+		island[n++] = enc_ldr_post(addr_scratch);
 	island[n++] = enc_ldr_post(status);
 	island[n++] = enc_ldr_post(tmp);
 	{ int32_t off = (int32_t)(orig_addr + 1 - &island[n]); island[n] = enc_b(off); n++; }
