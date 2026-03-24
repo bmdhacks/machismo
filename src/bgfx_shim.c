@@ -46,6 +46,7 @@
 #define INIT_PLATFORM_OFFSET    24  /* after type+vendor+device+caps+debug+profile+pad */
 #define PLATFORM_NDT_OFFSET     0
 #define PLATFORM_NWH_OFFSET     8
+#define PLATFORM_CTX_OFFSET    16
 
 /* SDL2 function pointers — resolved at runtime via dlsym */
 typedef struct SDL_Window SDL_Window;
@@ -288,16 +289,44 @@ bool bgfx_init_wrapper(const void* _init)
 						        wl_display, wl_surface);
 					}
 				} else if (wminfo.subsystem == SDL_SYSWM_KMSDRM) {
-					/* KMSDRM union layout (at offset 8 in wminfo):
-					 *   +0: int dev_index, +4: int drm_fd,
-					 *   +8: gbm_device*, +16: gbm_surface*
-					 * bgfx wants: ndt=gbm_device, nwh=gbm_surface */
-					uint8_t *info_base = (uint8_t *)&wminfo.x11_display;
-					void *gbm_dev     = *(void **)(info_base + 8);
-					void *gbm_surface = *(void **)(info_base + 16);
-					*ndt = gbm_dev;
-					*nwh = gbm_surface;
-					fprintf(stderr, "bgfx_shim: KMSDRM gbm_dev=%p gbm_surface=%p\n", *ndt, *nwh);
+					/* KMSDRM: SDL keeps the GBM surface internal (not in WMInfo).
+					 * Create an SDL GL context so EGL is fully initialized,
+					 * then pass the current EGL display/context/surface to bgfx
+					 * so it shares SDL's context instead of creating a new one. */
+					typedef void* (*sdl_gl_create_fn)(void*);
+					sdl_gl_create_fn gl_create =
+						(sdl_gl_create_fn)dlsym(RTLD_DEFAULT, "SDL_GL_CreateContext");
+					if (gl_create) {
+						void *gl_ctx = gl_create(win);
+						if (gl_ctx) {
+							fprintf(stderr, "bgfx_shim: KMSDRM SDL GL context created: %p\n", gl_ctx);
+						} else {
+							fprintf(stderr, "bgfx_shim: KMSDRM SDL_GL_CreateContext failed\n");
+						}
+					}
+
+					/* Now grab EGL state that SDL set up */
+					typedef void* (*egl_get_display_fn)(void);
+					typedef void* (*egl_get_context_fn)(void);
+					typedef void* (*egl_get_surface_fn)(int);
+					egl_get_display_fn egl_get_display =
+						(egl_get_display_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentDisplay");
+					egl_get_context_fn egl_get_context =
+						(egl_get_context_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentContext");
+					egl_get_surface_fn egl_get_surface =
+						(egl_get_surface_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentSurface");
+
+					void *egl_display = egl_get_display ? egl_get_display() : NULL;
+					void *egl_context = egl_get_context ? egl_get_context() : NULL;
+					void *egl_surface = egl_get_surface ? egl_get_surface(0x3060 /*EGL_DRAW*/) : NULL;
+
+					*ndt = egl_display;
+					*nwh = egl_surface;
+					void** ctx = (void**)(init_copy + INIT_PLATFORM_OFFSET + PLATFORM_CTX_OFFSET);
+					*ctx = egl_context;
+
+					fprintf(stderr, "bgfx_shim: KMSDRM EGL display=%p context=%p surface=%p\n",
+					        egl_display, egl_context, egl_surface);
 				} else {
 					fprintf(stderr, "bgfx_shim: unknown SDL subsystem %d\n",
 					        wminfo.subsystem);
