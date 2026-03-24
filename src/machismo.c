@@ -38,6 +38,7 @@
 #include "bgfx_shim.h"
 #include "eh_frame.h"
 #include "dylib_loader.h"
+#include "lse_emul.h"
 #include <sys/resource.h>
 #include <pthread.h>
 #include <sys/utsname.h>
@@ -154,16 +155,53 @@ int main(int argc, char** argv, char** envp)
 		}
 	}
 
-	/* Downgrade ARMv8.3 RCPC instructions to ARMv8.0 equivalents.
-	 * Apple Silicon (A12+) supports LDAPR/LDAPRB/LDAPRH (load-acquire RCpc),
-	 * but older ARMv8.0 cores (Cortex-A35/A53/A55) do not. Replace with
-	 * the stronger LDAR/LDARB/LDARH (full acquire barrier) — always correct,
-	 * just slightly slower. Must run before any Mach-O code executes. */
+	/* LSE emulation state — shared between main exe and dylib patching */
+	uint32_t *lse_pool_cur = NULL;
+	uint32_t *lse_pool_end = NULL;
+	int lse_total = 0;
+
+	/* Patch ARMv8.1+ instructions for ARMv8.0 compatibility.
+	 * Apple Silicon (A12+) uses LDAPR (ARMv8.3 RCPC) and LDADD/SWP/CAS
+	 * (ARMv8.1 LSE atomics). Older cores (Cortex-A35/A53/A55) lack these.
+	 *
+	 * RCPC: replaced in-place with full-barrier equivalents (LDAR).
+	 * LSE: replaced with B to islands containing LDXR/STXR loops.
+	 *
+	 * Must run before any Mach-O code executes. */
 	if (machismo_load_results.mh) {
 		struct mach_header_64* mh = (struct mach_header_64*)machismo_load_results.mh;
 		uint8_t* cmds = (uint8_t*)(mh + 1);
 		uint32_t p = 0;
 		int rcpc_fixed = 0;
+
+		/* Allocate island pool for LSE emulation (near __TEXT for B range).
+		 * Find the end of the last executable segment for placement. */
+		uintptr_t text_end = 0;
+		uint32_t lp = 0;
+		for (uint32_t li = 0; li < mh->ncmds && lp < mh->sizeofcmds; li++) {
+			struct load_command* llc = (struct load_command*)(cmds + lp);
+			if (llc->cmd == LC_SEGMENT_64) {
+				struct segment_command_64* lseg = (struct segment_command_64*)llc;
+				uintptr_t seg_end = lseg->vmaddr + machismo_load_results.slide + lseg->vmsize;
+				if ((lseg->maxprot & VM_PROT_EXECUTE) && seg_end > text_end)
+					text_end = seg_end;
+			}
+			lp += llc->cmdsize;
+		}
+		/* Allocate 512KB pool after text — enough for ~7000 islands */
+		size_t lse_pool_size = 512 * 1024;
+		uint32_t* lse_pool = (uint32_t*)mmap(
+			(void*)((text_end + 0xFFF) & ~0xFFF),
+			lse_pool_size,
+			PROT_READ | PROT_WRITE | PROT_EXEC,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (lse_pool == MAP_FAILED) {
+			fprintf(stderr, "machismo: WARNING: LSE pool mmap failed\n");
+			lse_pool = NULL;
+		}
+
+		lse_pool_cur = lse_pool;
+		lse_pool_end = lse_pool ? lse_pool + lse_pool_size / 4 : NULL;
 		for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
 			struct load_command* lc = (struct load_command*)(cmds + p);
 			if (lc->cmd == LC_SEGMENT_64) {
@@ -173,25 +211,34 @@ int main(int argc, char** argv, char** envp)
 					size_t count = seg->vmsize / 4;
 					/* Make writable for patching */
 					mprotect(code, seg->vmsize, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+					/* RCPC: in-place downgrade */
 					for (size_t j = 0; j < count; j++) {
-						/* LDAPR/LDAPRB/LDAPRH: bits[29:10] == 0x38BFC000
-						 * Size in [31:30], Rn in [9:5], Rt in [4:0] */
 						if ((code[j] & 0x3FFFFC00) == 0x38BFC000) {
-							/* Replace with LDAR/LDARB/LDARH: same size/Rn/Rt */
 							code[j] = (code[j] & 0xC00003FF) | 0x08DFFC00;
 							rcpc_fixed++;
 						}
 					}
-					/* Restore original protections */
+
+					/* LSE: replace with B to island */
+					if (lse_pool_cur) {
+						int n = lse_emul_patch(code, seg->vmsize,
+						                       &lse_pool_cur, lse_pool_end);
+						lse_total += n;
+					}
+
 					mprotect(code, seg->vmsize, native_prot(seg->initprot));
-					/* Flush icache after code modification */
 					__builtin___clear_cache((char*)code, (char*)code + seg->vmsize);
 				}
 			}
 			p += lc->cmdsize;
 		}
+		if (lse_pool)
+			__builtin___clear_cache((char*)lse_pool, (char*)lse_pool + lse_pool_size);
 		if (rcpc_fixed > 0)
 			fprintf(stderr, "machismo: downgraded %d ARMv8.3 RCPC instructions to ARMv8.0\n", rcpc_fixed);
+		if (lse_total > 0)
+			fprintf(stderr, "machismo: patched %d ARMv8.1 LSE atomics with LDXR/STXR islands\n", lse_total);
 	}
 
 	/* Resolve chained fixups — patch GOT with native Linux .so addresses.
@@ -270,6 +317,11 @@ int main(int argc, char** argv, char** envp)
 								code[dj] = (code[dj] & 0xC00003FF) | 0x08DFFC00;
 								dfix++;
 							}
+						}
+						if (lse_pool_cur) {
+							int ln = lse_emul_patch(code, dseg->vmsize,
+							                        &lse_pool_cur, lse_pool_end);
+							lse_total += ln;
 						}
 						mprotect(code, dseg->vmsize, native_prot(dseg->initprot));
 						__builtin___clear_cache((char*)code, (char*)code + dseg->vmsize);

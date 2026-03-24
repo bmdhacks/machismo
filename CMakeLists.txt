@@ -20,6 +20,7 @@ set(MACHISMO_SOURCES
     src/bgfx_shim.c
     src/eh_frame.c
     src/dylib_loader.c
+    src/lse_emul.c
     src/elfcalls/elfcalls.c
     src/elfcalls/threads.c
 )
