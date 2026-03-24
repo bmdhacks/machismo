@@ -52,6 +52,8 @@
 static void load64(int fd, bool expect_dylinker, struct load_results* lr);
 static void load_fat(int fd, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
 static void load(const char* path, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
+static void fixup_darwin_pthread_data(struct load_results* lr);
+static void setup_tlv_image(struct load_results* lr);
 static int native_prot(int prot);
 static void setup_space(struct load_results* lr, bool is_64_bit);
 static void start_thread(struct load_results* lr);
@@ -214,6 +216,13 @@ int main(int argc, char** argv, char** envp)
 		for (int i = 0; i < g_num_macho_dylibs; i++) {
 			dylib_loader_run_inits(&g_macho_dylibs[i]);
 		}
+	}
+
+	/* Fix macOS pthread objects and set up TLV before the __DATA guard
+	 * locks down pages (the pthread scan reads all writable segments). */
+	if (machismo_load_results.mh) {
+		fixup_darwin_pthread_data(&machismo_load_results);
+		setup_tlv_image(&machismo_load_results);
 	}
 
 	/* Register Mach-O exception handling frames with system unwinder.
@@ -744,11 +753,8 @@ static void start_thread(struct load_results* lr) {
 		typedef int (*main_func_t)(int, char**, char**, char**);
 		main_func_t entry = (main_func_t)lr->entry_point;
 
-		/* Fix macOS pthread objects before any Mach-O code runs */
-		fixup_darwin_pthread_data(lr);
-
-		/* Set up TLV image info for _tlv_bootstrap */
-		setup_tlv_image(lr);
+		/* pthread fixup and TLV setup are done earlier in main(),
+		 * before the __DATA guard locks down pages. */
 
 		/* Run C++ static initializers before main */
 		run_init_offsets(lr);
