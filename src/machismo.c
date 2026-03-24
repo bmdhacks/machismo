@@ -154,6 +154,46 @@ int main(int argc, char** argv, char** envp)
 		}
 	}
 
+	/* Downgrade ARMv8.3 RCPC instructions to ARMv8.0 equivalents.
+	 * Apple Silicon (A12+) supports LDAPR/LDAPRB/LDAPRH (load-acquire RCpc),
+	 * but older ARMv8.0 cores (Cortex-A35/A53/A55) do not. Replace with
+	 * the stronger LDAR/LDARB/LDARH (full acquire barrier) — always correct,
+	 * just slightly slower. Must run before any Mach-O code executes. */
+	if (machismo_load_results.mh) {
+		struct mach_header_64* mh = (struct mach_header_64*)machismo_load_results.mh;
+		uint8_t* cmds = (uint8_t*)(mh + 1);
+		uint32_t p = 0;
+		int rcpc_fixed = 0;
+		for (uint32_t i = 0; i < mh->ncmds && p < mh->sizeofcmds; i++) {
+			struct load_command* lc = (struct load_command*)(cmds + p);
+			if (lc->cmd == LC_SEGMENT_64) {
+				struct segment_command_64* seg = (struct segment_command_64*)lc;
+				if (seg->maxprot & VM_PROT_EXECUTE) {
+					uint32_t* code = (uint32_t*)(seg->vmaddr + machismo_load_results.slide);
+					size_t count = seg->vmsize / 4;
+					/* Make writable for patching */
+					mprotect(code, seg->vmsize, PROT_READ | PROT_WRITE | PROT_EXEC);
+					for (size_t j = 0; j < count; j++) {
+						/* LDAPR/LDAPRB/LDAPRH: bits[29:10] == 0x38BFC000
+						 * Size in [31:30], Rn in [9:5], Rt in [4:0] */
+						if ((code[j] & 0x3FFFFC00) == 0x38BFC000) {
+							/* Replace with LDAR/LDARB/LDARH: same size/Rn/Rt */
+							code[j] = (code[j] & 0xC00003FF) | 0x08DFFC00;
+							rcpc_fixed++;
+						}
+					}
+					/* Restore original protections */
+					mprotect(code, seg->vmsize, native_prot(seg->initprot));
+					/* Flush icache after code modification */
+					__builtin___clear_cache((char*)code, (char*)code + seg->vmsize);
+				}
+			}
+			p += lc->cmdsize;
+		}
+		if (rcpc_fixed > 0)
+			fprintf(stderr, "machismo: downgraded %d ARMv8.3 RCPC instructions to ARMv8.0\n", rcpc_fixed);
+	}
+
 	/* Resolve chained fixups — patch GOT with native Linux .so addresses.
 	 * The resolver handles MACHO: entries in dylib_map.conf by loading
 	 * Mach-O dylibs and looking up symbols in their LC_SYMTAB.
@@ -208,6 +248,38 @@ int main(int argc, char** argv, char** envp)
 				}
 				lp += seg->cmdsize;
 			}
+		}
+
+		/* Downgrade RCPC instructions in loaded Mach-O dylibs too */
+		for (int i = 0; i < g_num_macho_dylibs; i++) {
+			struct macho_dylib_info *mdi = &g_macho_dylibs[i];
+			struct mach_header_64 *dmh = mdi->mh;
+			uint8_t *dcmds = (uint8_t*)(dmh + 1);
+			uint32_t dp = 0;
+			int dfix = 0;
+			for (uint32_t di = 0; di < dmh->ncmds && dp < dmh->sizeofcmds; di++) {
+				struct load_command *dlc = (struct load_command*)(dcmds + dp);
+				if (dlc->cmd == LC_SEGMENT_64) {
+					struct segment_command_64 *dseg = (struct segment_command_64*)dlc;
+					if (dseg->maxprot & VM_PROT_EXECUTE) {
+						uint32_t *code = (uint32_t*)(dseg->vmaddr + mdi->slide);
+						size_t cnt = dseg->vmsize / 4;
+						mprotect(code, dseg->vmsize, PROT_READ | PROT_WRITE | PROT_EXEC);
+						for (size_t dj = 0; dj < cnt; dj++) {
+							if ((code[dj] & 0x3FFFFC00) == 0x38BFC000) {
+								code[dj] = (code[dj] & 0xC00003FF) | 0x08DFFC00;
+								dfix++;
+							}
+						}
+						mprotect(code, dseg->vmsize, native_prot(dseg->initprot));
+						__builtin___clear_cache((char*)code, (char*)code + dseg->vmsize);
+					}
+				}
+				dp += dlc->cmdsize;
+			}
+			if (dfix > 0)
+				fprintf(stderr, "machismo: downgraded %d RCPC instructions in dylib '%s'\n",
+				        dfix, mdi->path);
 		}
 
 		/* Run static initializers for loaded Mach-O dylibs.
