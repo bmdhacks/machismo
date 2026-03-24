@@ -188,16 +188,33 @@ int main(int argc, char** argv, char** envp)
 			}
 			lp += llc->cmdsize;
 		}
-		/* Allocate 512KB pool after text — enough for ~7000 islands */
+		/* Allocate 512KB pool near __TEXT for B range (±128MB).
+		 * Use MAP_FIXED_NOREPLACE with multiple fallback addresses,
+		 * same strategy as the trampoline island pool. */
 		size_t lse_pool_size = 512 * 1024;
-		uint32_t* lse_pool = (uint32_t*)mmap(
-			(void*)((text_end + 0xFFF) & ~0xFFF),
-			lse_pool_size,
-			PROT_READ | PROT_WRITE | PROT_EXEC,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (lse_pool == MAP_FAILED) {
-			fprintf(stderr, "machismo: WARNING: LSE pool mmap failed\n");
+		uintptr_t page_sz = sysconf(_SC_PAGESIZE);
+		uintptr_t lse_try[] = {
+			(text_end + page_sz - 1) & ~(page_sz - 1),
+			((text_end + 64*1024*1024) & ~(page_sz - 1)),
+			text_end >= lse_pool_size + page_sz ?
+				(text_end - lse_pool_size - 0x838000) & ~(page_sz - 1) : 0,
+		};
+		uint32_t* lse_pool = NULL;
+		for (int ti = 0; ti < (int)(sizeof(lse_try)/sizeof(lse_try[0])); ti++) {
+			if (lse_try[ti] == 0) continue;
+			lse_pool = (uint32_t*)mmap((void*)lse_try[ti], lse_pool_size,
+				PROT_READ | PROT_WRITE | PROT_EXEC,
+				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+				-1, 0);
+			if (lse_pool != MAP_FAILED) {
+				fprintf(stderr, "machismo: LSE island pool at %p (near __TEXT end %p)\n",
+				        lse_pool, (void*)text_end);
+				break;
+			}
 			lse_pool = NULL;
+		}
+		if (!lse_pool) {
+			fprintf(stderr, "machismo: WARNING: LSE pool mmap failed — LSE atomics will SIGILL\n");
 		}
 
 		lse_pool_cur = lse_pool;
