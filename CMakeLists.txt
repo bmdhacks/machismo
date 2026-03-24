@@ -64,6 +64,7 @@ if(BUILD_TESTS)
     target_include_directories(test_lse_emul PRIVATE src)
     target_compile_options(test_lse_emul PRIVATE -Wall -O2 -g)
     target_compile_definitions(test_lse_emul PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_lse_emul PRIVATE pthread)
 endif()
 
 # --- install ---
