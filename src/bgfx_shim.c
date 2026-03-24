@@ -59,7 +59,7 @@ typedef struct {
 /* SDL_SysWMinfo subsystem enum (SDL2 header order) */
 #define SDL_SYSWM_X11      2
 #define SDL_SYSWM_WAYLAND  6
-#define SDL_SYSWM_KMSDRM  15
+#define SDL_SYSWM_KMSDRM  13
 
 static void* (*sdl_GetWindowFromID)(uint32_t id) = NULL;
 static int (*sdl_GetWindowWMInfo)(SDL_Window*, void* info) = NULL;
