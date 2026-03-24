@@ -28,6 +28,15 @@ if [ ! -d "$SRC_DIR/libcxx" ]; then
     exit 1
 fi
 
+# Bullseye branch requires LLVM 15 (trunk won't build with Bullseye's GCC)
+# LLVM 15.0.7 — Bullseye's GCC can't build LLVM trunk
+LLVM_REV="8dfdcc7b7bf66834a761bd8de445840ef68e4d1a"
+CURRENT=$(cd "$SRC_DIR" && git rev-parse HEAD)
+if [ "$CURRENT" != "$LLVM_REV" ]; then
+    echo "Fetching LLVM 15.0.7..."
+    (cd "$SRC_DIR" && git fetch --depth 1 origin "$LLVM_REV" && git checkout -f "$LLVM_REV")
+fi
+
 # Apply macOS pthread compatibility patches (idempotent)
 PATCH="$(pwd)/$PATCH_DIR/libcxx-darwin-pthread-compat.patch"
 if [ -f "$PATCH" ]; then
@@ -48,13 +57,12 @@ cmake -G Ninja -S "$SRC_DIR/runtimes" -B "$BUILD_DIR" \
     -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
     -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang \
-    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_CXX_COMPILER=g++ \
     -DLIBCXX_ABI_VERSION=1 \
     -DLIBCXX_ABI_DEFINES="_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT" \
     -DLIBCXX_ENABLE_SHARED=ON \
     -DLIBCXX_ENABLE_STATIC=OFF \
-    -DLIBCXX_ENABLE_EXPERIMENTAL_LIBRARY=OFF \
     -DLIBCXX_INCLUDE_TESTS=OFF \
     -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
     -DLIBCXXABI_ENABLE_SHARED=ON \

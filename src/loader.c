@@ -18,7 +18,7 @@ static void* compatible_mmap(void *addr, size_t length, int prot, int flags, int
 #ifndef PAGE_SIZE
 #	define PAGE_SIZE	4096
 #endif
-#define PAGE_ALIGN(x) (x & ~(PAGE_SIZE-1))
+#define PAGE_ALIGN(x) ((x) & ~(PAGE_SIZE-1))
 #define PAGE_ROUNDUP(x) (((((x)-1) / PAGE_SIZE)+1) * PAGE_SIZE)
 
 /* VM_PROT_* defined in macho_defs.h */

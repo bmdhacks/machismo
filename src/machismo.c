@@ -48,7 +48,7 @@
 #ifndef PAGE_SIZE
 #	define PAGE_SIZE	4096
 #endif
-#define PAGE_ALIGN(x) (x & ~(PAGE_SIZE-1))
+#define PAGE_ALIGN(x) ((x) & ~(PAGE_SIZE-1))
 
 static void load64(int fd, bool expect_dylinker, struct load_results* lr);
 static void load_fat(int fd, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
