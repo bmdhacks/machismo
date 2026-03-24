@@ -288,9 +288,15 @@ bool bgfx_init_wrapper(const void* _init)
 						        wl_display, wl_surface);
 					}
 				} else if (wminfo.subsystem == SDL_SYSWM_KMSDRM) {
-					/* KMSDRM: gbm_device as ndt, gbm_surface as nwh — works directly with EGL */
-					*ndt = wminfo.x11_display;
-					*nwh = (void*)(uintptr_t)wminfo.x11_window;
+					/* KMSDRM union layout (at offset 8 in wminfo):
+					 *   +0: int dev_index, +4: int drm_fd,
+					 *   +8: gbm_device*, +16: gbm_surface*
+					 * bgfx wants: ndt=gbm_device, nwh=gbm_surface */
+					uint8_t *info_base = (uint8_t *)&wminfo.x11_display;
+					void *gbm_dev     = *(void **)(info_base + 8);
+					void *gbm_surface = *(void **)(info_base + 16);
+					*ndt = gbm_dev;
+					*nwh = gbm_surface;
 					fprintf(stderr, "bgfx_shim: KMSDRM gbm_dev=%p gbm_surface=%p\n", *ndt, *nwh);
 				} else {
 					fprintf(stderr, "bgfx_shim: unknown SDL subsystem %d\n",
