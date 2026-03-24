@@ -1,0 +1,31 @@
+# Build artifacts
+machismo
+wrapgen
+libsystem_shim.so
+*.o
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# External library builds
+build-bgfx/
+build-libcxx/
+build-sfml/
+
+# Test fixtures (built from source)
+tests/fixtures/exit42
+tests/fixtures/exit0
+tests/fixtures/hello_write
+tests/fixtures/fat_binary
+tests/fixtures/fat_stub_x86
+tests/fixtures/with_lc_main
+tests/fixtures/trampoline_target
+tests/fixtures/libtest_native.so
+tests/test_bgfx_gles
+
+# Runtime
+userdata/
