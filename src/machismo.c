@@ -675,6 +675,7 @@ static void setup_tlv_image(struct load_results* lr)
 	 * the resolver may have loaded it with a relative or absolute path */
 	const char* shim_paths[] = {
 		"./libsystem_shim.so", "libsystem_shim.so",
+		"libs/libsystem_shim.so", "./libs/libsystem_shim.so",
 		NULL
 	};
 	void* shim = NULL;

@@ -5,6 +5,11 @@
 # (_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT) so Mach-O binaries compiled
 # against Apple's libc++ get the correct memory layout.
 #
+# LLVM version: Use llvmorg-15.0.7 for Bullseye compatibility.
+#   cd extern/llvm-project && git checkout llvmorg-15.0.7
+# The pthread mutex detection patch must be applied to the LLVM 15
+# location: libcxx/include/__threading_support (not __thread/support/pthread.h)
+#
 # Usage: ./scripts/build-libcxx.sh
 # Output: build-libcxx/lib/libc++.so.1
 

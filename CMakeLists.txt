@@ -31,6 +31,7 @@ target_compile_options(machismo PRIVATE -Wall -O2 -g)
 target_compile_definitions(machismo PRIVATE
     INSTALL_PREFIX=""
     SYSTEM_ROOT=""
+    _GNU_SOURCE
 )
 target_link_libraries(machismo PRIVATE dl rt pthread m)
 

@@ -22,7 +22,8 @@ mkdir -p "$OUTDIR"
 # Use Apple-ABI libc++ so std::string layout matches the Mach-O game binary.
 # The game was built with _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT (Apple's SSO).
 LIBCXX_INCLUDES="-nostdinc++ -I build-libcxx/include/c++/v1"
-LIBCXX_LINK="-L build-libcxx/lib -Wl,-rpath,\$ORIGIN/../build-libcxx/lib -lc++ -nostdlib++"
+# -nostdlib++ is clang-only; use explicit libs for GCC compatibility (Bullseye)
+LIBCXX_LINK="-L build-libcxx/lib -Wl,-rpath,\$ORIGIN/../build-libcxx/lib -lc++ -lc++abi -nodefaultlibs -lc -lm -lgcc_s -lgcc"
 
 BX_INCLUDES="-I extern/bx/include -I extern/bx/include/compat/linux -I extern/bx/3rdparty"
 BIMG_INCLUDES="-I extern/bimg/include -I extern/bx/include -I extern/bx/include/compat/linux -I extern/bimg/3rdparty -I extern/bimg/3rdparty/astc-encoder/include -I extern/bimg/3rdparty/tinyexr/deps/miniz -I extern/bimg/3rdparty/iqa/include"
