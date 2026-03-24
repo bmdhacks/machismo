@@ -31,6 +31,7 @@
 
 #include "bgfx_shim.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <dlfcn.h>
@@ -173,11 +174,20 @@ void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, u
 #define SDL_WINDOW_FULLSCREEN         0x00000001
 #define SDL_WINDOW_FULLSCREEN_DESKTOP 0x00001001
 #define SDL_WINDOW_ALLOW_HIGHDPI      0x00002000
-	/* Strip fullscreen — force windowed for development.
-	 * Target hardware (KMSDRM) will need this re-enabled. */
-	if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+	/* Detect KMSDRM: check SDL_VIDEODRIVER or absence of DISPLAY/WAYLAND.
+	 * On KMSDRM, fullscreen is the only valid mode — stripping it breaks
+	 * EGL surface creation. On X11/Wayland, strip fullscreen for dev. */
+	const char *video_drv = getenv("SDL_VIDEODRIVER");
+	int is_kmsdrm = (video_drv && strcmp(video_drv, "KMSDRM") == 0)
+	             || (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY"));
+	if (!is_kmsdrm && (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP))) {
 		fprintf(stderr, "bgfx_shim: stripping fullscreen flags 0x%x\n", flags);
 		flags &= ~(SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
+	if (is_kmsdrm) {
+		/* Force FULLSCREEN_DESKTOP on KMSDRM for proper EGL surface */
+		flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+		fprintf(stderr, "bgfx_shim: KMSDRM detected, forcing fullscreen\n");
 	}
 	/* Strip ALLOW_HIGHDPI — prevents drawable/window size mismatch. */
 	if (flags & SDL_WINDOW_ALLOW_HIGHDPI) {
