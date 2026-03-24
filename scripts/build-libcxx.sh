@@ -5,10 +5,11 @@
 # (_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT) so Mach-O binaries compiled
 # against Apple's libc++ get the correct memory layout.
 #
-# LLVM version: Use llvmorg-15.0.7 for Bullseye compatibility.
+# Patches for macOS pthread compatibility (mutex/condvar signature
+# detection) are applied automatically from patches/.
+#
+# LLVM version: Use llvmorg-15.0.7 for Bullseye/older glibc targets.
 #   cd extern/llvm-project && git checkout llvmorg-15.0.7
-# The pthread mutex detection patch must be applied to the LLVM 15
-# location: libcxx/include/__threading_support (not __thread/support/pthread.h)
 #
 # Usage: ./scripts/build-libcxx.sh
 # Output: build-libcxx/lib/libc++.so.1
@@ -20,10 +21,25 @@ cd "$(dirname "$0")/.."
 
 BUILD_DIR=build-libcxx
 SRC_DIR=extern/llvm-project
+PATCH_DIR=patches
 
 if [ ! -d "$SRC_DIR/libcxx" ]; then
     echo "Error: $SRC_DIR/libcxx not found. Run: git submodule update --init extern/llvm-project"
     exit 1
+fi
+
+# Apply macOS pthread compatibility patches (idempotent)
+PATCH="$(pwd)/$PATCH_DIR/libcxx-darwin-pthread-compat.patch"
+if [ -f "$PATCH" ]; then
+    if (cd "$SRC_DIR" && git apply --check --reverse "$PATCH" 2>/dev/null); then
+        echo "Patch already applied, skipping."
+    elif (cd "$SRC_DIR" && git apply --check "$PATCH" 2>/dev/null); then
+        echo "Applying macOS pthread compatibility patch..."
+        (cd "$SRC_DIR" && git apply "$PATCH")
+    else
+        echo "Warning: patch does not apply cleanly — may need updating for this LLVM version."
+        echo "Continuing anyway (patches may already be applied manually)."
+    fi
 fi
 
 echo "Configuring Apple-ABI libc++ build..."

@@ -1,0 +1,86 @@
+diff --git a/libcxx/include/__threading_support b/libcxx/include/__threading_support
+index a7f0da972a8..056ce8482ae 100644
+--- a/libcxx/include/__threading_support
++++ b/libcxx/include/__threading_support
+@@ -62,7 +62,9 @@ _LIBCPP_BEGIN_NAMESPACE_STD
+ #if defined(_LIBCPP_HAS_THREAD_API_PTHREAD)
+ // Mutex
+ typedef pthread_mutex_t __libcpp_mutex_t;
+-#define _LIBCPP_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
++/* Use recursive mutex for Apple ABI compatibility — macOS game code
++   may re-lock std::mutex from the same thread without deadlocking. */
++#define _LIBCPP_MUTEX_INITIALIZER PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
+ 
+ typedef pthread_mutex_t __libcpp_recursive_mutex_t;
+ 
+@@ -299,13 +301,34 @@ int __libcpp_recursive_mutex_destroy(__libcpp_recursive_mutex_t *__m)
+   return pthread_mutex_destroy(__m);
+ }
+ 
++/* Detect macOS PTHREAD_MUTEX_INITIALIZER (sig=0x32AAABA7) and reinitialize
++   as a recursive mutex for Linux. Mach-O inline constructors write this
++   signature at runtime, so we catch it here on first lock. */
+ int __libcpp_mutex_lock(__libcpp_mutex_t *__m)
+ {
++  long* __sig = (long*)__m;
++  if (*__sig == 0x32AAABA7L || *__sig == 0x32AAABA1L) {
++    pthread_mutexattr_t __attr;
++    pthread_mutexattr_init(&__attr);
++    pthread_mutexattr_settype(&__attr, PTHREAD_MUTEX_RECURSIVE);
++    __builtin_memset(__m, 0, sizeof(pthread_mutex_t));
++    pthread_mutex_init(__m, &__attr);
++    pthread_mutexattr_destroy(&__attr);
++  }
+   return pthread_mutex_lock(__m);
+ }
+ 
+ bool __libcpp_mutex_trylock(__libcpp_mutex_t *__m)
+ {
++  long* __sig = (long*)__m;
++  if (*__sig == 0x32AAABA7L || *__sig == 0x32AAABA1L) {
++    pthread_mutexattr_t __attr;
++    pthread_mutexattr_init(&__attr);
++    pthread_mutexattr_settype(&__attr, PTHREAD_MUTEX_RECURSIVE);
++    __builtin_memset(__m, 0, sizeof(pthread_mutex_t));
++    pthread_mutex_init(__m, &__attr);
++    pthread_mutexattr_destroy(&__attr);
++  }
+   return pthread_mutex_trylock(__m) == 0;
+ }
+ 
+@@ -320,6 +343,20 @@ int __libcpp_mutex_destroy(__libcpp_mutex_t *__m)
+ }
+ 
+ // Condition Variable
++
++/* Detect macOS PTHREAD_COND_INITIALIZER (sig=0x3CB0B1BB) and reinitialize
++   for Linux. Same pattern as the mutex fixup above — Mach-O code writes
++   the macOS signature at construction time, and the libsystem_shim
++   interposition doesn't reach calls made from within this .so. */
++static inline void __fixup_darwin_cond(__libcpp_condvar_t *__cv)
++{
++  long *__sig = (long *)__cv;
++  if (*__sig == 0x3CB0B1BBL) {
++    __builtin_memset(__cv, 0, sizeof(pthread_cond_t));
++    pthread_cond_init(__cv, 0);
++  }
++}
++
+ int __libcpp_condvar_signal(__libcpp_condvar_t *__cv)
+ {
+   return pthread_cond_signal(__cv);
+@@ -332,12 +369,14 @@ int __libcpp_condvar_broadcast(__libcpp_condvar_t *__cv)
+ 
+ int __libcpp_condvar_wait(__libcpp_condvar_t *__cv, __libcpp_mutex_t *__m)
+ {
++  __fixup_darwin_cond(__cv);
+   return pthread_cond_wait(__cv, __m);
+ }
+ 
+ int __libcpp_condvar_timedwait(__libcpp_condvar_t *__cv, __libcpp_mutex_t *__m,
+                                __libcpp_timespec_t *__ts)
+ {
++  __fixup_darwin_cond(__cv);
+   return pthread_cond_timedwait(__cv, __m, __ts);
+ }
+ 
