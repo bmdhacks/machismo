@@ -547,6 +547,83 @@ static void test_edge_cases(void)
 }
 
 /* ================================================================
+ * Contention test — forces STLXR retry path
+ * ================================================================ */
+
+#include <pthread.h>
+
+struct contention_args {
+	void (*fn)(struct test_params *);
+	uint64_t *shared_mem;
+	int iterations;
+};
+
+static void *contention_thread(void *arg)
+{
+	struct contention_args *ca = (struct contention_args *)arg;
+	for (int i = 0; i < ca->iterations; i++) {
+		struct test_params p = {
+			.addr = ca->shared_mem,
+			.rs_val = 1,
+			.rt_val = 0,
+			.rt_out = 0,
+			.rs_out = 0,
+		};
+		ca->fn(&p);
+	}
+	return NULL;
+}
+
+static void test_contention(void)
+{
+	printf("=== Contention test: two threads doing LDADDAL on same word ===\n");
+
+	/* Generate LDADDAL x20, x21, [x19] (dword, acq+rel) */
+	uint32_t insn = encode_lse(LSE_LDADD, 3, 1, 1, STD_RS, STD_RT, STD_RN);
+	uint32_t *fn_code = &code_base[code_offset];
+	int fn_size;
+	generate_test_fn(fn_code, STD_RS, STD_RT, STD_RN, insn, &fn_size);
+
+	uint32_t *lse_ptr = &fn_code[fn_size - 7]; /* approximate — find the LSE insn */
+	/* Actually, use generate_test_fn's return value */
+	int fn_size2;
+	int lse_off = generate_test_fn(fn_code, STD_RS, STD_RT, STD_RN, insn, &fn_size2);
+	lse_emul_patch(&fn_code[lse_off], 4, &pool_cur, pool_end);
+	__builtin___clear_cache((char *)fn_code, (char *)(fn_code + fn_size2));
+	__builtin___clear_cache((char *)pool_cur - POOL_SIZE, (char *)pool_cur);
+	code_offset += fn_size2;
+
+	typedef void (*test_fn_t)(struct test_params *);
+	test_fn_t fn = (test_fn_t)fn_code;
+
+	uint64_t shared __attribute__((aligned(16))) = 0;
+	int iters = 100000;
+
+	struct contention_args args[2] = {
+		{ .fn = fn, .shared_mem = &shared, .iterations = iters },
+		{ .fn = fn, .shared_mem = &shared, .iterations = iters },
+	};
+
+	pthread_t t1, t2;
+	pthread_create(&t1, NULL, contention_thread, &args[0]);
+	pthread_create(&t2, NULL, contention_thread, &args[1]);
+	pthread_join(t1, NULL);
+	pthread_join(t2, NULL);
+
+	tests_run++;
+	uint64_t expected = (uint64_t)iters * 2;
+	if (shared == expected) {
+		tests_passed++;
+		printf("PASS: contention LDADDAL — %llu == %llu (2 threads × %d iterations)\n",
+		       (unsigned long long)shared, (unsigned long long)expected, iters);
+	} else {
+		tests_failed++;
+		fprintf(stderr, "FAIL: contention LDADDAL — got %llu, expected %llu\n",
+		        (unsigned long long)shared, (unsigned long long)expected);
+	}
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 
@@ -558,6 +635,7 @@ int main(void)
 
 	test_all_basic();
 	test_edge_cases();
+	test_contention();
 
 	printf("\n=== Results: %d/%d passed, %d failed ===\n",
 	       tests_passed, tests_run, tests_failed);

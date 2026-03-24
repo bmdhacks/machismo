@@ -256,7 +256,7 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 		/* stxr/stlxr w_tmp, Rt, [Rn] */
 		island[n++] = enc_stxr(d->size, d->release, tmp, d->rt, d->rn);
 		/* cbnz w_tmp, loop_start */
-		{ int off = loop_start - (n + 1); island[n] = enc_cbnz_w(tmp, off); n++; }
+		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
 		/* b done (+1 to skip the clrex) */
 		island[n++] = enc_b(2);  /* skip clrex + mov below... actually let me restructure */
 
@@ -283,7 +283,7 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 		/* b.ne to fail path: skip stlxr(1) + cbnz(1) = +2 instructions = 3 words ahead */
 		island[n++] = 0x54000000 | (3 << 5) | COND_NE;
 		island[n++] = enc_stxr(d->size, d->release, tmp, d->rt, d->rn);
-		{ int off = loop_start - (n + 1); island[n] = enc_cbnz_w(tmp, off); n++; }
+		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
 		/* Success: fall through. Fail: lands here too. */
 		/* Both paths: Rs = loaded value, clear exclusive monitor */
 		island[n++] = 0xD5033F5F;  /* clrex */
@@ -409,7 +409,7 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 
 		/* stxr uses tmp as status, status_reg as value */
 		island[n++] = enc_stxr(d->size, d->release, tmp, status_reg, d->rn);
-		{ int off = loop_start - (n + 1); island[n] = enc_cbnz_w(tmp, off); n++; }
+		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
 		island[n++] = enc_ldr_post(status_reg);
 		island[n++] = enc_ldr_post(tmp);
 		{ int32_t off = (int32_t)(orig_addr + 1 - &island[n]); island[n] = enc_b(off); n++; }
@@ -498,7 +498,7 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 	}
 
 	island[n++] = enc_stxr(d->size, d->release, status, tmp, addr_reg);
-	{ int off = loop_start - (n + 1); island[n] = enc_cbnz_w(status, off); n++; }
+	{ int off = loop_start - n; island[n] = enc_cbnz_w(status, off); n++; }
 	if (addr_scratch >= 0)
 		island[n++] = enc_ldr_post(addr_scratch);
 	island[n++] = enc_ldr_post(status);
