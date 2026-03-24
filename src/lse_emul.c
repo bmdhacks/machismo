@@ -115,6 +115,18 @@ static inline uint32_t enc_mov(int is64, int rd, int rn)
 	return enc_orr(is64, rd, 31, rn);
 }
 
+/* SXTB Wd, Wn (sign-extend byte to 32 bits): SBFM Wd, Wn, #0, #7 */
+static inline uint32_t enc_sxtb(int rd, int rn)
+{
+	return 0x13001C00 | (rn << 5) | rd;
+}
+
+/* SXTH Wd, Wn (sign-extend halfword to 32 bits): SBFM Wd, Wn, #0, #15 */
+static inline uint32_t enc_sxth(int rd, int rn)
+{
+	return 0x13003C00 | (rn << 5) | rd;
+}
+
 /* Condition codes for CSEL */
 #define COND_GT 0xC  /* signed greater than */
 #define COND_LT 0xB  /* signed less than */
@@ -361,11 +373,23 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 			island[n++] = enc_orr(is_x, status_reg, load_reg, d->rs);
 			break;
 		case LSE_LDSMAX:
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
+			if (d->size < 2) {
+				island[n++] = (d->size == 0) ? enc_sxtb(status_reg, load_reg) : enc_sxth(status_reg, load_reg);
+				island[n++] = (d->size == 0) ? enc_sxtb(tmp, d->rs) : enc_sxth(tmp, d->rs);
+				island[n++] = enc_cmp(0, status_reg, tmp);
+			} else {
+				island[n++] = enc_cmp(is_x, load_reg, d->rs);
+			}
 			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_LT);
 			break;
 		case LSE_LDSMIN:
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
+			if (d->size < 2) {
+				island[n++] = (d->size == 0) ? enc_sxtb(status_reg, load_reg) : enc_sxth(status_reg, load_reg);
+				island[n++] = (d->size == 0) ? enc_sxtb(tmp, d->rs) : enc_sxth(tmp, d->rs);
+				island[n++] = enc_cmp(0, status_reg, tmp);
+			} else {
+				island[n++] = enc_cmp(is_x, load_reg, d->rs);
+			}
 			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_GT);
 			break;
 		case LSE_LDUMAX:
@@ -438,11 +462,24 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 		island[n++] = enc_orr(is_x, tmp, load_reg, d->rs);
 		break;
 	case LSE_LDSMAX:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
+		if (d->size < 2) {
+			/* Byte/half: sign-extend for comparison, pick from originals */
+			island[n++] = (d->size == 0) ? enc_sxtb(tmp, load_reg) : enc_sxth(tmp, load_reg);
+			island[n++] = (d->size == 0) ? enc_sxtb(status, d->rs) : enc_sxth(status, d->rs);
+			island[n++] = enc_cmp(0, tmp, status);
+		} else {
+			island[n++] = enc_cmp(is_x, load_reg, d->rs);
+		}
 		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_LT);
 		break;
 	case LSE_LDSMIN:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
+		if (d->size < 2) {
+			island[n++] = (d->size == 0) ? enc_sxtb(tmp, load_reg) : enc_sxth(tmp, load_reg);
+			island[n++] = (d->size == 0) ? enc_sxtb(status, d->rs) : enc_sxth(status, d->rs);
+			island[n++] = enc_cmp(0, tmp, status);
+		} else {
+			island[n++] = enc_cmp(is_x, load_reg, d->rs);
+		}
 		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_GT);
 		break;
 	case LSE_LDUMAX:

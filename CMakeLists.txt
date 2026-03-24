@@ -57,6 +57,15 @@ if(BUILD_WRAPGEN)
     target_link_libraries(wrapgen PRIVATE dl)
 endif()
 
+# --- test_lse_emul ---
+
+if(BUILD_TESTS)
+    add_executable(test_lse_emul tests/test_lse_emul.c src/lse_emul.c)
+    target_include_directories(test_lse_emul PRIVATE src)
+    target_compile_options(test_lse_emul PRIVATE -Wall -O2 -g)
+    target_compile_definitions(test_lse_emul PRIVATE _GNU_SOURCE)
+endif()
+
 # --- install ---
 
 install(TARGETS machismo RUNTIME DESTINATION bin)
