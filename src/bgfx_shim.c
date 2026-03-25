@@ -71,6 +71,11 @@ static void* real_bgfx_init_fn = NULL;
 static void* real_bgfx_frame_fn = NULL;
 static int forced_renderer_type = BGFX_V118_TYPE_OPENGLES;
 
+/* KMSDRM: bgfx skips eglSwapBuffers when context is provided externally.
+ * We capture the EGL state during init and swap manually after each frame. */
+static void* kmsdrm_egl_display = NULL;
+static void* kmsdrm_egl_surface = NULL;
+
 /* Wayland EGL window wrapping — resolved at runtime from libwayland-egl.so.1 */
 static void* wayland_egl_lib = NULL;
 static void* (*wl_egl_window_create_fn)(void* surface, int width, int height) = NULL;
@@ -325,6 +330,8 @@ bool bgfx_init_wrapper(const void* _init)
 					void** ctx = (void**)(init_copy + INIT_PLATFORM_OFFSET + PLATFORM_CTX_OFFSET);
 					*ctx = egl_context;
 
+						kmsdrm_egl_display = egl_display;
+					kmsdrm_egl_surface = egl_surface;
 					fprintf(stderr, "bgfx_shim: KMSDRM EGL display=%p context=%p surface=%p\n",
 					        egl_display, egl_context, egl_surface);
 				} else {
@@ -477,7 +484,21 @@ uint32_t bgfx_frame_wrapper(bool capture)
 	}
 
 	typedef uint32_t (*bgfx_frame_fn)(bool);
-	return ((bgfx_frame_fn)real_bgfx_frame_fn)(capture);
+	uint32_t result = ((bgfx_frame_fn)real_bgfx_frame_fn)(capture);
+
+	/* KMSDRM: bgfx doesn't swap when context was provided externally.
+	 * Use SDL_GL_SwapWindow (not raw eglSwapBuffers) so SDL can do
+	 * the GBM surface lock and DRM page flip that KMSDRM requires. */
+	if (kmsdrm_egl_display && captured_sdl_window) {
+		typedef void (*sdl_swap_fn)(void*);
+		static sdl_swap_fn swap_fn = NULL;
+		if (!swap_fn)
+			swap_fn = (sdl_swap_fn)dlsym(RTLD_DEFAULT, "SDL_GL_SwapWindow");
+		if (swap_fn)
+			swap_fn(captured_sdl_window);
+	}
+
+	return result;
 }
 
 /* ------------------------------------------------------------------ */

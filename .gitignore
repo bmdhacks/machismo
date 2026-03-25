@@ -29,3 +29,4 @@ tests/test_bgfx_gles
 
 # Runtime
 userdata/
+test_lse_emul

@@ -19,6 +19,18 @@ OUTDIR="build-bgfx"
 
 mkdir -p "$OUTDIR"
 
+# Apply buffer orphaning patch (proper GL orphaning instead of destroy+create)
+ORPHAN_PATCH="patches/bgfx-buffer-orphan.patch"
+if [ -f "$ORPHAN_PATCH" ]; then
+    if git -C extern/bgfx diff --quiet src/renderer_gl.h 2>/dev/null && \
+       git -C extern/bgfx diff --cached --quiet src/renderer_gl.h 2>/dev/null; then
+        echo "Applying bgfx buffer orphaning patch..."
+        git -C extern/bgfx apply "../../$ORPHAN_PATCH"
+    else
+        echo "bgfx renderer_gl.h already modified, skipping patch"
+    fi
+fi
+
 # Use Apple-ABI libc++ so std::string layout matches the Mach-O game binary.
 # The game was built with _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT (Apple's SSO).
 LIBCXX_INCLUDES="-nostdinc++ -I build-libcxx/include/c++/v1"
