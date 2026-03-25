@@ -39,6 +39,7 @@
 #include "eh_frame.h"
 #include "dylib_loader.h"
 #include "lse_emul.h"
+/* heap_trace lives in the shim .so — resolved via dlsym, no direct include needed */
 #include <sys/resource.h>
 #include <pthread.h>
 #include <sys/utsname.h>
@@ -314,13 +315,58 @@ int main(int argc, char** argv, char** envp)
 			}
 		}
 
-		/* Downgrade RCPC instructions in loaded Mach-O dylibs too */
+		/* Downgrade RCPC and LSE instructions in loaded Mach-O dylibs.
+		 * Each dylib needs its own island pool near its __TEXT since
+		 * the main pool is too far away for a ±128MB B instruction. */
 		for (int i = 0; i < g_num_macho_dylibs; i++) {
 			struct macho_dylib_info *mdi = &g_macho_dylibs[i];
 			struct mach_header_64 *dmh = mdi->mh;
 			uint8_t *dcmds = (uint8_t*)(dmh + 1);
 			uint32_t dp = 0;
 			int dfix = 0;
+
+			/* Find dylib text extent for island pool placement */
+			uintptr_t dylib_text_end = 0;
+			for (uint32_t di = 0; di < dmh->ncmds && dp < dmh->sizeofcmds; di++) {
+				struct load_command *dlc = (struct load_command*)(dcmds + dp);
+				if (dlc->cmd == LC_SEGMENT_64) {
+					struct segment_command_64 *dseg = (struct segment_command_64*)dlc;
+					if (dseg->maxprot & VM_PROT_EXECUTE) {
+						uintptr_t end = dseg->vmaddr + mdi->slide + dseg->vmsize;
+						if (end > dylib_text_end)
+							dylib_text_end = end;
+					}
+				}
+				dp += dlc->cmdsize;
+			}
+
+			/* Allocate per-dylib island pool near its text */
+			uint32_t *dylib_lse_pool = NULL;
+			uint32_t *dylib_lse_cur = NULL;
+			uint32_t *dylib_lse_end = NULL;
+			size_t dylib_pool_size = 64 * 1024;
+			uintptr_t dpg = sysconf(_SC_PAGESIZE);
+			if (dylib_text_end) {
+				uintptr_t try_addr = (dylib_text_end + dpg - 1) & ~(dpg - 1);
+				dylib_lse_pool = (uint32_t*)mmap((void*)try_addr, dylib_pool_size,
+					PROT_READ | PROT_WRITE | PROT_EXEC,
+					MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+				if (dylib_lse_pool == MAP_FAILED && mdi->slide >= dylib_pool_size + dpg) {
+					try_addr = (mdi->slide - dylib_pool_size) & ~(dpg - 1);
+					dylib_lse_pool = (uint32_t*)mmap((void*)try_addr, dylib_pool_size,
+						PROT_READ | PROT_WRITE | PROT_EXEC,
+						MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+				}
+				if (dylib_lse_pool != MAP_FAILED && dylib_lse_pool != NULL) {
+					dylib_lse_cur = dylib_lse_pool;
+					dylib_lse_end = dylib_lse_pool + dylib_pool_size / 4;
+				} else {
+					dylib_lse_pool = NULL;
+				}
+			}
+
+			dp = 0;
+			int dln = 0;
 			for (uint32_t di = 0; di < dmh->ncmds && dp < dmh->sizeofcmds; di++) {
 				struct load_command *dlc = (struct load_command*)(dcmds + dp);
 				if (dlc->cmd == LC_SEGMENT_64) {
@@ -335,9 +381,10 @@ int main(int argc, char** argv, char** envp)
 								dfix++;
 							}
 						}
-						if (lse_pool_cur) {
+						if (dylib_lse_cur) {
 							int ln = lse_emul_patch(code, dseg->vmsize,
-							                        &lse_pool_cur, lse_pool_end);
+							                        &dylib_lse_cur, dylib_lse_end);
+							dln += ln;
 							lse_total += ln;
 						}
 						mprotect(code, dseg->vmsize, native_prot(dseg->initprot));
@@ -346,9 +393,15 @@ int main(int argc, char** argv, char** envp)
 				}
 				dp += dlc->cmdsize;
 			}
+			if (dylib_lse_pool)
+				__builtin___clear_cache((char*)dylib_lse_pool,
+					(char*)dylib_lse_pool + dylib_pool_size);
 			if (dfix > 0)
 				fprintf(stderr, "machismo: downgraded %d RCPC instructions in dylib '%s'\n",
 				        dfix, mdi->path);
+			if (dln > 0)
+				fprintf(stderr, "machismo: patched %d LSE atomics in dylib '%s' (pool at %p)\n",
+				        dln, mdi->path, dylib_lse_pool);
 		}
 
 		/* Run static initializers for loaded Mach-O dylibs.
@@ -382,6 +435,21 @@ int main(int argc, char** argv, char** envp)
 	if (machismo_load_results.mh) {
 		for (int i = 0; i < cfg.num_trampolines; i++) {
 			machismo_trampoline_config_t* tc = &cfg.trampolines[i];
+
+			/* Override mode: exact-symbol matching from an override .so */
+			if (tc->override_lib) {
+				void* oh = dlopen(tc->override_lib, RTLD_LAZY);
+				if (oh) {
+					trampoline_patch_overrides(
+						(void*)machismo_load_results.mh,
+						machismo_load_results.slide, oh);
+				} else {
+					fprintf(stderr, "machismo: warning: cannot load override lib %s: %s\n",
+					        tc->override_lib, dlerror());
+				}
+				if (!tc->lib) continue;  /* override-only section, no prefix patching */
+			}
+
 			if (!tc->lib || tc->num_prefixes == 0) continue;
 
 			trampoline_override_t* overrides = NULL;
@@ -490,6 +558,13 @@ int main(int argc, char** argv, char** envp)
 	if (machismo_load_results.mh) {
 		gdb_jit_register_macho((void*)machismo_load_results.mh,
 		                       machismo_load_results.slide);
+		/* Wire up heap_trace symbol resolution for Mach-O addresses.
+		 * heap_trace lives in the shim .so, so resolve via dlsym. */
+		typedef void (*set_resolver_fn)(const char *(*)(uintptr_t));
+		set_resolver_fn set_resolver = (set_resolver_fn)dlsym(
+			RTLD_DEFAULT, "heap_trace_set_symbol_resolver");
+		if (set_resolver)
+			set_resolver(gdb_jit_lookup_addr);
 	}
 
 	/* Apply game-specific binary patches */
@@ -716,39 +791,6 @@ static int try_fixup_pthread_at(uintptr_t addr) {
 	return 0;
 }
 
-/* Check if a symbol name looks like a pthread object */
-static int name_is_pthread_like(const char *name) {
-	/* Check for common substrings in mangled/demangled names */
-	if (!name) return 0;
-	/* C++ std::mutex, std::recursive_mutex, etc. */
-	if (strstr(name, "mutex") || strstr(name, "Mutex")) return 1;
-	/* pthread_cond, condition_variable */
-	if (strstr(name, "cond") || strstr(name, "Cond")) return 1;
-	/* rwlock */
-	if (strstr(name, "rwlock") || strstr(name, "RWLock") || strstr(name, "Rwlock")) return 1;
-	/* C++ guard variables for static locals (often guard mutex-containing objects) */
-	if (strstr(name, "_once") || strstr(name, "Once")) return 1;
-	/* lock objects */
-	if (strstr(name, "_lock") || strstr(name, "Lock")) return 1;
-	return 0;
-}
-
-/* Convert a file offset to memory address using segment mappings */
-static void* fixup_fileoff_to_mem(struct mach_header_64* mh, uintptr_t slide, uint32_t fileoff)
-{
-	uint8_t* cmd_ptr = (uint8_t*)(mh + 1);
-	for (uint32_t i = 0; i < mh->ncmds; i++) {
-		struct load_command* lc = (struct load_command*)cmd_ptr;
-		if (lc->cmd == LC_SEGMENT_64) {
-			struct segment_command_64* seg = (struct segment_command_64*)lc;
-			if (fileoff >= seg->fileoff && fileoff < seg->fileoff + seg->filesize) {
-				return (void*)(seg->vmaddr + slide + (fileoff - seg->fileoff));
-			}
-		}
-		cmd_ptr += lc->cmdsize;
-	}
-	return NULL;
-}
 
 static void fixup_darwin_pthread_data(struct load_results* lr) {
 	struct mach_header_64* mh = (struct mach_header_64*)lr->mh;

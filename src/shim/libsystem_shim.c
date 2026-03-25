@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include "heap_trace.h"
 
 /* ===== Mach time ===== */
 
@@ -99,6 +100,13 @@ static void init_stdio_globals(void)
 	__stdinp  = stdin;
 	__stdoutp = stdout;
 	__stderrp = stderr;
+	heap_trace_init();
+}
+
+__attribute__((destructor))
+static void fini_shim(void)
+{
+	heap_trace_close();
 }
 
 /* ===== errno ===== */
@@ -190,7 +198,7 @@ static const char* get_fake_home(void)
 		char *slash = strrchr(exe, '/');
 		if (slash) {
 			*slash = '\0';
-			snprintf(fake_home, sizeof(fake_home), "%s/userdata", exe);
+			snprintf(fake_home, sizeof(fake_home), "%.4085s/userdata", exe);
 		}
 	}
 	if (!fake_home[0])
@@ -1128,7 +1136,10 @@ struct dirent *shim_readdir_r(DIR *dirp, void *entry, void **result)
 	struct dirent linux_entry;
 	struct dirent *linux_result = NULL;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 	int ret = readdir_r(dirp, &linux_entry, &linux_result);
+#pragma GCC diagnostic pop
 	if (ret != 0 || !linux_result) {
 		if (result) *(void**)result = NULL;
 		return (struct dirent *)(intptr_t)ret;
@@ -1149,4 +1160,155 @@ struct dirent *shim_readdir_r(DIR *dirp, void *entry, void **result)
 
 	if (result) *(void**)result = de;
 	return (struct dirent *)(intptr_t)ret;
+}
+
+/* ===== mmap registry ===== */
+
+/* Track mmap'd regions so shim_free can munmap instead of free.
+ * Used by game function replacements (e.g., DataStream::preloadFile → mmap). */
+
+#include <sys/mman.h>
+
+#define MMAP_REGISTRY_MAX 16
+
+static struct {
+	void *addr;
+	size_t size;
+} mmap_registry[MMAP_REGISTRY_MAX];
+static int mmap_registry_count = 0;
+
+void mmap_registry_add(void *addr, size_t size)
+{
+	if (mmap_registry_count >= MMAP_REGISTRY_MAX) {
+		fprintf(stderr, "mmap_registry: full, cannot register %p\n", addr);
+		return;
+	}
+	mmap_registry[mmap_registry_count].addr = addr;
+	mmap_registry[mmap_registry_count].size = size;
+	mmap_registry_count++;
+	fprintf(stderr, "mmap_registry: registered %p (%zu bytes)\n", addr, size);
+}
+
+/* Returns size if found and removed, 0 if not found */
+static size_t mmap_registry_remove(void *addr)
+{
+	for (int i = 0; i < mmap_registry_count; i++) {
+		if (mmap_registry[i].addr == addr) {
+			size_t size = mmap_registry[i].size;
+			mmap_registry[i] = mmap_registry[--mmap_registry_count];
+			return size;
+		}
+	}
+	return 0;
+}
+
+/* ===== Heap allocation wrappers ===== */
+
+/* Intercept malloc/free/calloc/realloc for:
+ * 1. Zero-initialization (macOS malloc compat)
+ * 2. Heaptrack-compatible allocation tracing (MACHISMO_HEAPTRACK env var)
+ *
+ * Uses dlsym(RTLD_NEXT) to find the real glibc functions.
+ * The __asm__ labels export these under standard names so the resolver
+ * finds them when the Mach-O imports from libSystem.B.dylib. */
+
+typedef void *(*real_malloc_fn)(size_t);
+typedef void  (*real_free_fn)(void *);
+typedef void *(*real_calloc_fn)(size_t, size_t);
+typedef void *(*real_realloc_fn)(void *, size_t);
+
+static real_malloc_fn  real_malloc  = NULL;
+static real_free_fn    real_free    = NULL;
+static real_calloc_fn  real_calloc  = NULL;
+static real_realloc_fn real_realloc = NULL;
+
+/* Bootstrap: dlsym itself may call malloc, so we need a tiny fallback
+ * allocator for the very first calls before dlsym resolves. */
+static char bootstrap_buf[4096];
+static int bootstrap_pos = 0;
+
+static void resolve_real_funcs(void)
+{
+	if (real_malloc) return;
+	real_malloc  = (real_malloc_fn)dlsym(RTLD_NEXT, "malloc");
+	real_free    = (real_free_fn)dlsym(RTLD_NEXT, "free");
+	real_calloc  = (real_calloc_fn)dlsym(RTLD_NEXT, "calloc");
+	real_realloc = (real_realloc_fn)dlsym(RTLD_NEXT, "realloc");
+}
+
+void *shim_malloc(size_t size) __asm__("malloc");
+void *shim_malloc(size_t size)
+{
+	if (!real_malloc) {
+		resolve_real_funcs();
+		if (!real_malloc) {
+			/* Bootstrap: return zeroed memory from static buffer */
+			int aligned = (bootstrap_pos + 15) & ~15;
+			if (aligned + (int)size <= (int)sizeof(bootstrap_buf)) {
+				void *p = bootstrap_buf + aligned;
+				memset(p, 0, size);
+				bootstrap_pos = aligned + size;
+				return p;
+			}
+			return NULL;
+		}
+	}
+	/* Zero-initialize for macOS compat (macOS malloc returns zeroed pages) */
+	void *p = real_malloc(size);
+	if (p) {
+		memset(p, 0, size);
+		if (heap_trace_active)
+			heap_trace_alloc(p, size);
+	}
+	return p;
+}
+
+void shim_free(void *ptr) __asm__("free");
+void shim_free(void *ptr)
+{
+	if (!ptr) return;
+	/* Don't free bootstrap allocations */
+	if ((char *)ptr >= bootstrap_buf &&
+	    (char *)ptr < bootstrap_buf + sizeof(bootstrap_buf))
+		return;
+	/* Check mmap registry: munmap instead of free for mmap'd regions */
+	size_t mmap_size = mmap_registry_remove(ptr);
+	if (mmap_size) {
+		if (heap_trace_active)
+			heap_trace_free(ptr);
+		munmap(ptr, mmap_size);
+		return;
+	}
+	if (heap_trace_active)
+		heap_trace_free(ptr);
+	if (!real_free) resolve_real_funcs();
+	if (real_free) real_free(ptr);
+}
+
+void *shim_calloc(size_t nmemb, size_t size) __asm__("calloc");
+void *shim_calloc(size_t nmemb, size_t size)
+{
+	if (!real_calloc) {
+		resolve_real_funcs();
+		if (!real_calloc) {
+			/* Bootstrap fallback */
+			size_t total = nmemb * size;
+			return shim_malloc(total);
+		}
+	}
+	void *p = real_calloc(nmemb, size);
+	if (p && heap_trace_active)
+		heap_trace_alloc(p, nmemb * size);
+	return p;
+}
+
+void *shim_realloc(void *ptr, size_t size) __asm__("realloc");
+void *shim_realloc(void *ptr, size_t size)
+{
+	if (!real_realloc) resolve_real_funcs();
+	if (!real_realloc) return NULL;
+	void *new_ptr = real_realloc(ptr, size);
+	if (heap_trace_active)
+		heap_trace_realloc(ptr, new_ptr, size);
+	return new_ptr;
 }

@@ -40,6 +40,18 @@ static inline uint32_t enc_ldr_post(int rt)
 	return 0xF84107E0 | rt;  /* ldr Xt, [sp], #16 */
 }
 
+/* MRS Xt, NZCV */
+static inline uint32_t enc_mrs_nzcv(int rt)
+{
+	return 0xD53B4200 | rt;
+}
+
+/* MSR NZCV, Xt */
+static inline uint32_t enc_msr_nzcv(int rt)
+{
+	return 0xD51B4200 | rt;
+}
+
 /* LDXR / LDAXR — load exclusive (32 or 64 bit)
  * size: 2=32bit, 3=64bit
  * acquire: 1=LDAXR, 0=LDXR */
@@ -135,20 +147,18 @@ static inline uint32_t enc_sxth(int rd, int rn)
 #define COND_EQ 0x0  /* equal */
 #define COND_NE 0x1  /* not equal */
 
-/* Pick a scratch register that doesn't conflict with rs, rt, rn.
- * Avoids SP(31) and the three operand registers. */
-static int pick_scratch(int rs, int rt, int rn)
+/* Pick a scratch register that doesn't conflict with the given mask. */
+static int pick_scratch(uint32_t exclude_mask)
 {
 	for (int r = 16; r >= 9; r--) {
-		if (r != rs && r != rt && r != rn)
+		if (!(exclude_mask & (1U << r)))
 			return r;
 	}
-	/* Fallback to higher registers */
 	for (int r = 17; r <= 28; r++) {
-		if (r != rs && r != rt && r != rn)
+		if (!(exclude_mask & (1U << r)))
 			return r;
 	}
-	return 15;  /* should never get here */
+	return 8;  /* fallback */
 }
 
 /* LSE instruction classification */
@@ -224,285 +234,129 @@ static int emit_island(struct lse_decoded *d, uint32_t *island,
 	/* For ALU ops: size 3 (dword) uses X registers, else W */
 	int is_x = (d->size == 3);
 
-	int tmp = pick_scratch(d->rs, d->rt, d->rn);
-	int rt_is_zr = (d->rt == 31);
-
-	/* Use Rt directly for the loaded value if Rt != XZR.
-	 * If Rt == XZR (STADD etc.), use tmp for the loaded value. */
-	int load_reg = rt_is_zr ? tmp : d->rt;
-
-	/* Save scratch register */
-	island[n++] = enc_str_pre(tmp);
-
 	if (d->op == LSE_CAS) {
-		/* CAS Rs, Rt, [Rn]:
-		 *   Load [Rn], compare with Rs.
-		 *   If equal, store Rt to [Rn].
-		 *   Rs gets the old value from [Rn] regardless.
-		 *
-		 * We need a second scratch for the loaded value since
-		 * we compare against Rs (which we can't clobber until the end). */
-		int tmp2 = pick_scratch(d->rs, d->rt, tmp);
-		/* Save tmp2 as well — use 16-byte aligned pair */
-		island[n++] = enc_str_pre(tmp2);
+		uint32_t mask = (1U << 31) | (1U << d->rs) | (1U << d->rt) | (1U << d->rn);
+		int s1 = pick_scratch(mask);
+		mask |= (1U << s1);
+		int s2 = pick_scratch(mask);
 
-		/* 1: ldxr/ldaxr tmp2, [Rn] */
+		/* Save scratches and NZCV */
+		island[n++] = enc_str_pre(s1);
+		island[n++] = enc_str_pre(s2);
+		island[n++] = enc_mrs_nzcv(s1);
+		island[n++] = enc_str_pre(s1);
+
 		int loop_start = n;
-		island[n++] = enc_ldxr(d->size, d->acquire, tmp2, d->rn);
-		/* cmp tmp2, Rs */
-		island[n++] = enc_cmp(is_x, tmp2, d->rs);
-		/* b.ne fail (skip stxr + cbnz = 2 instructions = +3 words forward) */
-		island[n++] = 0x54000000 | (3 << 5) | COND_NE;  /* b.ne +3 */
-		/* stxr/stlxr w_tmp, Rt, [Rn] */
-		island[n++] = enc_stxr(d->size, d->release, tmp, d->rt, d->rn);
-		/* cbnz w_tmp, loop_start */
-		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
-		/* b done (+1 to skip the clrex) */
-		island[n++] = enc_b(2);  /* skip clrex + mov below... actually let me restructure */
-
-		/* Hmm, need to handle the failed CAS path. Let me restructure:
-		 * 1: ldaxr  tmp2, [Rn]
-		 *    cmp    tmp2, Rs
-		 *    b.ne   3f
-		 *    stlxr  w_tmp, Rt, [Rn]
-		 *    cbnz   w_tmp, 1b
-		 * 3: mov    Rs, tmp2          (Rs gets old value)
-		 *    clrex                     (clear exclusive on failure path)
-		 *    ldr    tmp2, [sp], #16
-		 *    ldr    tmp, [sp], #16
-		 *    b      return
-		 */
-		/* Oops, I already emitted some instructions. Let me redo. */
-		n = 0;
-		island[n++] = enc_str_pre(tmp);
-		island[n++] = enc_str_pre(tmp2);
-
-		loop_start = n;
-		island[n++] = enc_ldxr(d->size, d->acquire, tmp2, d->rn);
-		island[n++] = enc_cmp(is_x, tmp2, d->rs);
-		/* b.ne to fail path: skip stlxr(1) + cbnz(1) = +2 instructions = 3 words ahead */
+		island[n++] = enc_ldxr(d->size, d->acquire, s2, d->rn);
+		island[n++] = enc_cmp(is_x, s2, d->rs);
+		
+		/* b.ne to fail path: skip stxr(1) + cbnz(1) = +2 instructions = 3 words ahead */
 		island[n++] = 0x54000000 | (3 << 5) | COND_NE;
-		island[n++] = enc_stxr(d->size, d->release, tmp, d->rt, d->rn);
-		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
-		/* Success: fall through. Fail: lands here too. */
-		/* Both paths: Rs = loaded value, clear exclusive monitor */
+		island[n++] = enc_stxr(d->size, d->release, s1, d->rt, d->rn);
+		{ int off = loop_start - n; island[n] = enc_cbnz_w(s1, off); n++; }
+		
+		/* Both paths land here */
 		island[n++] = 0xD5033F5F;  /* clrex */
 		if (d->rs != 31)
-			island[n++] = enc_mov(is_x, d->rs, tmp2);
-		island[n++] = enc_ldr_post(tmp2);
-		island[n++] = enc_ldr_post(tmp);
+			island[n++] = enc_mov(is_x, d->rs, s2);
+		
+		/* Restore NZCV */
+		island[n++] = enc_ldr_post(s1);
+		island[n++] = enc_msr_nzcv(s1);
+		/* Restore scratches */
+		island[n++] = enc_ldr_post(s2);
+		island[n++] = enc_ldr_post(s1);
+		
 		{ int32_t off = (int32_t)(orig_addr + 1 - &island[n]); island[n] = enc_b(off); n++; }
 		return n;
 	}
 
 	/* Non-CAS: LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP */
 
-	/* 1: ldxr/ldaxr load_reg, [Rn] */
+	uint32_t mask = (1U << 31) | (1U << d->rs) | (1U << d->rn);
+	if (d->rt != 31)
+		mask |= (1U << d->rt);
+
+	int s1 = pick_scratch(mask);
+	mask |= (1U << s1);
+	int s2 = pick_scratch(mask);
+	mask |= (1U << s2);
+	int s3 = pick_scratch(mask);
+
+	/* Save scratches and NZCV */
+	island[n++] = enc_str_pre(s1);
+	island[n++] = enc_str_pre(s2);
+	island[n++] = enc_str_pre(s3);
+	island[n++] = enc_mrs_nzcv(s1);
+	island[n++] = enc_str_pre(s1);
+
+	/* Unconditionally use scratches for all intermediate values.
+	 * LDXR loads into s1 (never Rt), so Rn, Rs, and Rt are all
+	 * untouched throughout the loop — eliminating every possible
+	 * aliasing hazard (Rs==Rt, Rt==Rn, Rs==Rt==Rn) by construction. */
+	int load_reg = s1;
+	int new_val_reg = s2;
+	int status_reg = s3;
+
 	int loop_start = n;
 	island[n++] = enc_ldxr(d->size, d->acquire, load_reg, d->rn);
 
-	/* Compute new value into tmp */
 	switch (d->op) {
 	case LSE_LDADD:
-		island[n++] = enc_add(is_x, tmp, load_reg, d->rs);
+		island[n++] = enc_add(is_x, new_val_reg, load_reg, d->rs);
 		break;
 	case LSE_LDCLR:
-		island[n++] = enc_bic(is_x, tmp, load_reg, d->rs);
+		island[n++] = enc_bic(is_x, new_val_reg, load_reg, d->rs);
 		break;
 	case LSE_LDEOR:
-		island[n++] = enc_eor(is_x, tmp, load_reg, d->rs);
+		island[n++] = enc_eor(is_x, new_val_reg, load_reg, d->rs);
 		break;
 	case LSE_LDSET:
-		island[n++] = enc_orr(is_x, tmp, load_reg, d->rs);
+		island[n++] = enc_orr(is_x, new_val_reg, load_reg, d->rs);
 		break;
 	case LSE_LDSMAX:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_LT);
+	case LSE_LDSMIN: {
+		int t1 = new_val_reg;
+		int t2 = status_reg;
+		if (d->size < 2) {
+			island[n++] = (d->size == 0) ? enc_sxtb(t1, load_reg) : enc_sxth(t1, load_reg);
+			island[n++] = (d->size == 0) ? enc_sxtb(t2, d->rs) : enc_sxth(t2, d->rs);
+			island[n++] = enc_cmp(0, t1, t2);
+		} else {
+			island[n++] = enc_cmp(is_x, load_reg, d->rs);
+		}
+		int cond = (d->op == LSE_LDSMAX) ? COND_LT : COND_GT;
+		island[n++] = enc_csel(is_x, new_val_reg, d->rs, load_reg, cond);
 		break;
-	case LSE_LDSMIN:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_GT);
-		break;
+	}
 	case LSE_LDUMAX:
+	case LSE_LDUMIN: {
 		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_LO);
+		int cond = (d->op == LSE_LDUMAX) ? COND_LO : COND_HI;
+		island[n++] = enc_csel(is_x, new_val_reg, d->rs, load_reg, cond);
 		break;
-	case LSE_LDUMIN:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_HI);
-		break;
+	}
 	case LSE_SWP:
-		/* New value is just Rs; tmp holds it for stxr */
-		island[n++] = enc_mov(is_x, tmp, d->rs);
+		island[n++] = enc_mov(is_x, new_val_reg, d->rs);
 		break;
 	default:
 		break;
 	}
 
-	/* stxr/stlxr w_scratch2, tmp, [Rn]
-	 * We need a different register for stxr status. Reuse load_reg
-	 * if it's not Rn (stxr status reg must differ from Rn and value reg).
-	 * For Rt==XZR case, load_reg==tmp, so we need another approach. */
-	int status_reg;
-	if (rt_is_zr) {
-		/* load_reg == tmp, so we need a different status reg.
-		 * Pick one that's not tmp, rs, rn. */
-		int tmp2 = pick_scratch(tmp, d->rs, d->rn);
-		status_reg = tmp2;
-		/* We need to save/restore tmp2 as well. Restructure with double save. */
-		/* Restart generation with double save */
-		n = 0;
-		island[n++] = enc_str_pre(tmp);
-		island[n++] = enc_str_pre(status_reg);
+	island[n++] = enc_stxr(d->size, d->release, status_reg, new_val_reg, d->rn);
+	{ int off = loop_start - n; island[n] = enc_cbnz_w(status_reg, off); n++; }
 
-		load_reg = tmp;
-		loop_start = n;
-		island[n++] = enc_ldxr(d->size, d->acquire, load_reg, d->rn);
+	/* Write old memory value to Rt after the loop succeeds */
+	if (d->rt != 31)
+		island[n++] = enc_mov(is_x, d->rt, load_reg);
 
-		switch (d->op) {
-		case LSE_LDADD:
-			island[n++] = enc_add(is_x, status_reg, load_reg, d->rs);
-			break;
-		case LSE_LDCLR:
-			island[n++] = enc_bic(is_x, status_reg, load_reg, d->rs);
-			break;
-		case LSE_LDEOR:
-			island[n++] = enc_eor(is_x, status_reg, load_reg, d->rs);
-			break;
-		case LSE_LDSET:
-			island[n++] = enc_orr(is_x, status_reg, load_reg, d->rs);
-			break;
-		case LSE_LDSMAX:
-			if (d->size < 2) {
-				island[n++] = (d->size == 0) ? enc_sxtb(status_reg, load_reg) : enc_sxth(status_reg, load_reg);
-				island[n++] = (d->size == 0) ? enc_sxtb(tmp, d->rs) : enc_sxth(tmp, d->rs);
-				island[n++] = enc_cmp(0, status_reg, tmp);
-			} else {
-				island[n++] = enc_cmp(is_x, load_reg, d->rs);
-			}
-			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_LT);
-			break;
-		case LSE_LDSMIN:
-			if (d->size < 2) {
-				island[n++] = (d->size == 0) ? enc_sxtb(status_reg, load_reg) : enc_sxth(status_reg, load_reg);
-				island[n++] = (d->size == 0) ? enc_sxtb(tmp, d->rs) : enc_sxth(tmp, d->rs);
-				island[n++] = enc_cmp(0, status_reg, tmp);
-			} else {
-				island[n++] = enc_cmp(is_x, load_reg, d->rs);
-			}
-			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_GT);
-			break;
-		case LSE_LDUMAX:
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
-			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_LO);
-			break;
-		case LSE_LDUMIN:
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
-			island[n++] = enc_csel(is_x, status_reg, d->rs, load_reg, COND_HI);
-			break;
-		case LSE_SWP:
-			island[n++] = enc_mov(is_x, status_reg, d->rs);
-			break;
-		default:
-			break;
-		}
+	/* Restore NZCV and scratches */
+	island[n++] = enc_ldr_post(s1);
+	island[n++] = enc_msr_nzcv(s1);
+	island[n++] = enc_ldr_post(s3);
+	island[n++] = enc_ldr_post(s2);
+	island[n++] = enc_ldr_post(s1);
 
-		/* stxr uses tmp as status, status_reg as value */
-		island[n++] = enc_stxr(d->size, d->release, tmp, status_reg, d->rn);
-		{ int off = loop_start - n; island[n] = enc_cbnz_w(tmp, off); n++; }
-		island[n++] = enc_ldr_post(status_reg);
-		island[n++] = enc_ldr_post(tmp);
-		{ int32_t off = (int32_t)(orig_addr + 1 - &island[n]); island[n] = enc_b(off); n++; }
-		return n;
-	}
-
-	/* Normal case: Rt != XZR, load_reg == Rt.
-	 *
-	 * We need two scratch registers:
-	 *   tmp:    holds the computed new value for stxr
-	 *   status: holds the stxr success/fail result
-	 *
-	 * When Rt == Rn, ldxr clobbers the address register with the loaded
-	 * value. We need a third scratch to preserve the address. */
-	int status = pick_scratch(tmp, d->rt, d->rn);
-
-	/* addr_reg: register holding the address for ldxr/stxr.
-	 * Normally Rn, but if Rt==Rn we copy Rn to a scratch first. */
-	int addr_reg = d->rn;
-	int addr_scratch = -1;
-	if (d->rt == d->rn && !rt_is_zr) {
-		/* Need a third scratch for the address */
-		addr_scratch = pick_scratch(tmp, status, d->rs);
-		addr_reg = addr_scratch;
-	}
-
-	/* Restart with saves */
-	n = 0;
-	island[n++] = enc_str_pre(tmp);
-	island[n++] = enc_str_pre(status);
-	if (addr_scratch >= 0) {
-		island[n++] = enc_str_pre(addr_scratch);
-		island[n++] = enc_mov(1, addr_scratch, d->rn);  /* copy address */
-	}
-
-	loop_start = n;
-	island[n++] = enc_ldxr(d->size, d->acquire, load_reg, addr_reg);
-
-	switch (d->op) {
-	case LSE_LDADD:
-		island[n++] = enc_add(is_x, tmp, load_reg, d->rs);
-		break;
-	case LSE_LDCLR:
-		island[n++] = enc_bic(is_x, tmp, load_reg, d->rs);
-		break;
-	case LSE_LDEOR:
-		island[n++] = enc_eor(is_x, tmp, load_reg, d->rs);
-		break;
-	case LSE_LDSET:
-		island[n++] = enc_orr(is_x, tmp, load_reg, d->rs);
-		break;
-	case LSE_LDSMAX:
-		if (d->size < 2) {
-			/* Byte/half: sign-extend for comparison, pick from originals */
-			island[n++] = (d->size == 0) ? enc_sxtb(tmp, load_reg) : enc_sxth(tmp, load_reg);
-			island[n++] = (d->size == 0) ? enc_sxtb(status, d->rs) : enc_sxth(status, d->rs);
-			island[n++] = enc_cmp(0, tmp, status);
-		} else {
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		}
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_LT);
-		break;
-	case LSE_LDSMIN:
-		if (d->size < 2) {
-			island[n++] = (d->size == 0) ? enc_sxtb(tmp, load_reg) : enc_sxth(tmp, load_reg);
-			island[n++] = (d->size == 0) ? enc_sxtb(status, d->rs) : enc_sxth(status, d->rs);
-			island[n++] = enc_cmp(0, tmp, status);
-		} else {
-			island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		}
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_GT);
-		break;
-	case LSE_LDUMAX:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_LO);
-		break;
-	case LSE_LDUMIN:
-		island[n++] = enc_cmp(is_x, load_reg, d->rs);
-		island[n++] = enc_csel(is_x, tmp, d->rs, load_reg, COND_HI);
-		break;
-	case LSE_SWP:
-		island[n++] = enc_mov(is_x, tmp, d->rs);
-		break;
-	default:
-		break;
-	}
-
-	island[n++] = enc_stxr(d->size, d->release, status, tmp, addr_reg);
-	{ int off = loop_start - n; island[n] = enc_cbnz_w(status, off); n++; }
-	if (addr_scratch >= 0)
-		island[n++] = enc_ldr_post(addr_scratch);
-	island[n++] = enc_ldr_post(status);
-	island[n++] = enc_ldr_post(tmp);
 	{ int32_t off = (int32_t)(orig_addr + 1 - &island[n]); island[n] = enc_b(off); n++; }
 	return n;
 }
@@ -519,8 +373,8 @@ int lse_emul_patch(uint32_t *code, size_t code_size,
 		if (!decode_lse(code[i], &d))
 			continue;
 
-		/* Check pool space (max island ~48 bytes = 12 words) */
-		if (island + 16 > pool_end) {
+		/* Check pool space (max island ~96 bytes = 24 words) */
+		if (island + 24 > pool_end) {
 			fprintf(stderr, "lse_emul: island pool exhausted after %d patches\n", patched);
 			break;
 		}

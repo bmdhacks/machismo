@@ -26,6 +26,16 @@ int trampoline_patch_lib(void* mh, uintptr_t slide,
                          trampoline_override_t* overrides, int num_overrides);
 
 /*
+ * Patch Mach-O functions by exact symbol match against an override .so.
+ *
+ * For each N_SECT|N_EXT symbol in __TEXT, strips one leading underscore
+ * and calls dlsym(override_handle, name). If found, writes a trampoline.
+ *
+ * Returns number of functions patched, or -1 on error.
+ */
+int trampoline_patch_overrides(void* mh, uintptr_t slide, void* override_handle);
+
+/*
  * Legacy API — reads MACHISMO_TRAMPOLINE_LIB and MACHISMO_TRAMPOLINE_PREFIX env vars.
  * Kept for backward compatibility with tests.
  */

@@ -2,6 +2,9 @@
 # Test runner for machismo and wrapgen
 cd "$(dirname "$0")/.."
 
+export MACHISMO_ROOT="$(pwd)"
+export BUILD_DIR="$MACHISMO_ROOT/build"
+
 PASS=0
 FAIL=0
 TOTAL=0

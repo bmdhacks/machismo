@@ -527,6 +527,76 @@ int trampoline_patch_lib(void* mh, uintptr_t slide,
 	return patched;
 }
 
+int trampoline_patch_overrides(void* mh, uintptr_t slide, void* override_handle)
+{
+	struct mach_header_64* header = (struct mach_header_64*)mh;
+	uint8_t* cmd_ptr = (uint8_t*)(header + 1);
+
+	/* Find LC_SYMTAB */
+	struct symtab_command* symtab = NULL;
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		struct load_command* lc = (struct load_command*)cmd_ptr;
+		if (lc->cmd == LC_SYMTAB) {
+			symtab = (struct symtab_command*)lc;
+			break;
+		}
+		cmd_ptr += lc->cmdsize;
+	}
+
+	if (!symtab) {
+		fprintf(stderr, "trampoline: override: no LC_SYMTAB found\n");
+		return -1;
+	}
+
+	struct nlist_64* nlist_arr = (struct nlist_64*)fileoff_to_mem(mh, slide, symtab->symoff);
+	char* strtab = (char*)fileoff_to_mem(mh, slide, symtab->stroff);
+
+	if (!nlist_arr || !strtab) {
+		fprintf(stderr, "trampoline: override: cannot locate symbol table\n");
+		return -1;
+	}
+
+	/* Make __TEXT writable (idempotent if already writable from a prior call) */
+	if (make_text_writable(mh, slide) < 0)
+		return -1;
+
+	int patched = 0;
+
+	for (uint32_t i = 0; i < symtab->nsyms; i++) {
+		struct nlist_64* sym = &nlist_arr[i];
+
+		if ((sym->n_type & N_TYPE) != N_SECT) continue;
+		if (!(sym->n_type & N_EXT)) continue;
+		if (sym->n_type & N_STAB) continue;
+		if (sym->n_strx >= symtab->strsize) continue;
+
+		const char* name = strtab + sym->n_strx;
+		uintptr_t func_addr = sym->n_value + slide;
+
+		/* Only patch symbols in __TEXT */
+		if (func_addr < text_patch_base ||
+		    func_addr >= text_patch_base + text_patch_size)
+			continue;
+
+		/* Strip one leading underscore (Mach-O convention) for dlsym */
+		const char* lookup_name = name;
+		if (lookup_name[0] == '_') lookup_name++;
+
+		void* target = dlsym(override_handle, lookup_name);
+		if (!target) continue;
+
+		if (write_trampoline(func_addr, (uintptr_t)target) == 0) {
+			fprintf(stderr, "trampoline: override: %s -> %p\n", name, target);
+			patched++;
+		}
+	}
+
+	restore_text_protection();
+
+	fprintf(stderr, "trampoline: override: %d functions replaced\n", patched);
+	return patched;
+}
+
 /* Legacy env-var based API */
 int trampoline_patch(void* mh, uintptr_t slide)
 {

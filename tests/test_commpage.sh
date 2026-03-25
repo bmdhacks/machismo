@@ -4,6 +4,8 @@
 # We check /proc/self/maps by running a binary that sleeps briefly.
 set -e
 cd "$(dirname "$0")/.."
+MACHISMO_ROOT="${MACHISMO_ROOT:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-$MACHISMO_ROOT/build}"
 
 # Use the exit42 fixture — machismo sets up commpage before jumping to it
 # We can check by examining our own maps since mldr forks/execs the binary
@@ -12,5 +14,5 @@ cd "$(dirname "$0")/.."
 # implicitly by successful execution).
 [ -f tests/fixtures/exit42 ] || bash tests/fixtures/build_fixtures.sh
 status=0
-./machismo tests/fixtures/exit42 2>/dev/null || status=$?
+"$BUILD_DIR/machismo" tests/fixtures/exit42 2>/dev/null || status=$?
 [ $status -eq 42 ]

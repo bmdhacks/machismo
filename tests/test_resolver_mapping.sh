@@ -2,6 +2,8 @@
 # Test: resolver reads dylib_map.conf and maps libraries correctly
 set -e
 cd "$(dirname "$0")/.."
+MACHISMO_ROOT="${MACHISMO_ROOT:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-$MACHISMO_ROOT/build}"
 
 NECRO_BIN="../necrodancer/depot_247086/NecroDancerSP.app/Contents/MacOS/NecroDancer"
 
@@ -10,7 +12,7 @@ if [ ! -f "$NECRO_BIN" ]; then
     exit 0
 fi
 
-output=$(MACHISMO_DYLIB_MAP=dylib_map.conf ./machismo "$NECRO_BIN" 2>&1 || true)
+output=$(MACHISMO_DYLIB_MAP=dylib_map.conf LD_LIBRARY_PATH="$BUILD_DIR" "$BUILD_DIR/machismo" "$NECRO_BIN" 2>&1 || true)
 
 # Should load the mapping config
 echo "$output" | grep -q "loaded.*dylib mappings"

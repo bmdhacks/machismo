@@ -75,11 +75,6 @@ static uint32_t enc_str_uoff(int rt, int rn, int uimm)
 	return 0xF9000000 | (imm12 << 10) | (rn << 5) | rt;
 }
 
-/* MOVZ Xd, #imm16 */
-static uint32_t enc_movz_x(int rd, uint16_t imm16)
-{
-	return 0xD2800000 | ((uint32_t)imm16 << 5) | rd;
-}
 
 /* ================================================================
  * LSE instruction encoder (inverse of decode_lse in lse_emul.c)
@@ -515,6 +510,24 @@ static void test_edge_cases(void)
 		             0xAAAABBBBCCCCDDDD, 0x0000000000000001, 0, label);
 	}
 
+	printf("=== Edge case: Rs == Rt (operand clobbered by load) ===\n");
+	for (int op = LSE_LDADD; op <= LSE_SWP; op++) {
+		char label[128];
+		snprintf(label, sizeof(label), "%s dword Rs==Rt", op_names[op]);
+		/* Rs=x20, Rt=x20, Rn=x19 — same register for source and destination */
+		run_one_test(op, 3, 1, 1, 20, 20, 19,
+		             0x1000, 0x0005, 0, label);
+	}
+
+	printf("=== Edge case: Rs == Rt == Rn (all three aliased) ===\n");
+	for (int op = LSE_LDADD; op <= LSE_SWP; op++) {
+		char label[128];
+		snprintf(label, sizeof(label), "%s dword Rs==Rt==Rn", op_names[op]);
+		/* Rs=x19, Rt=x19, Rn=x19 — all the same register */
+		run_one_test(op, 3, 1, 1, 19, 19, 19,
+		             0x1000, 0x0005, 0, label);
+	}
+
 	printf("=== Edge case: Rt == XZR (STADD etc., discard old value) ===\n");
 	for (int op = LSE_LDADD; op <= LSE_SWP; op++) {
 		char label[128];
@@ -584,7 +597,6 @@ static void test_contention(void)
 	int fn_size;
 	generate_test_fn(fn_code, STD_RS, STD_RT, STD_RN, insn, &fn_size);
 
-	uint32_t *lse_ptr = &fn_code[fn_size - 7]; /* approximate — find the LSE insn */
 	/* Actually, use generate_test_fn's return value */
 	int fn_size2;
 	int lse_off = generate_test_fn(fn_code, STD_RS, STD_RT, STD_RN, insn, &fn_size2);
@@ -624,6 +636,114 @@ static void test_contention(void)
 }
 
 /* ================================================================
+ * NZCV preservation test
+ * ================================================================ */
+
+struct nzcv_test_params {
+	uint64_t *addr;     /* +0:  pointer to memory location */
+	uint64_t rs_val;    /* +8:  value for Rs register */
+	uint64_t rt_val;    /* +16: value for Rt register */
+	uint64_t nzcv_in;   /* +24: NZCV to set before LSE op */
+	uint64_t nzcv_out;  /* +32: NZCV read after LSE op */
+};
+
+static int generate_nzcv_test_fn(uint32_t *code, int rs_reg, int rt_reg, int rn_reg,
+                                  uint32_t lse_insn, int *fn_size)
+{
+	int n = 0;
+	int lse_offset;
+
+	code[n++] = enc_stp_pre_sp(19, 20, -32);
+	code[n++] = enc_stp_off_sp(21, 22, 16);
+	code[n++] = enc_mov_x(22, 0);
+
+	code[n++] = enc_ldr_uoff(rn_reg, 22, 0);
+	if (rs_reg != rn_reg)
+		code[n++] = enc_ldr_uoff(rs_reg, 22, 8);
+	if (rt_reg != 31 && rt_reg != rn_reg && rt_reg != rs_reg)
+		code[n++] = enc_ldr_uoff(rt_reg, 22, 16);
+
+	/* Load desired NZCV and set it */
+	code[n++] = enc_ldr_uoff(0, 22, 24);   /* LDR x0, [x22, #24] */
+	code[n++] = 0xD51B4200;                 /* MSR NZCV, x0 */
+
+	lse_offset = n;
+	code[n++] = lse_insn;
+	code[n++] = ENC_NOP;
+
+	/* Read NZCV after the operation */
+	code[n++] = 0xD53B4200;                 /* MRS x0, NZCV */
+	code[n++] = enc_str_uoff(0, 22, 32);    /* STR x0, [x22, #32] */
+
+	code[n++] = enc_ldp_off_sp(21, 22, 16);
+	code[n++] = enc_ldp_post_sp(19, 20, 32);
+	code[n++] = ENC_RET;
+
+	*fn_size = n;
+	return lse_offset;
+}
+
+static void test_nzcv_preservation(void)
+{
+	printf("=== NZCV preservation test ===\n");
+
+	uint64_t nzcv_values[] = { 0xA0000000, 0x50000000, 0xF0000000, 0x00000000 };
+	int n_nzcv = sizeof(nzcv_values) / sizeof(nzcv_values[0]);
+
+	for (int nvi = 0; nvi < n_nzcv; nvi++) {
+		uint64_t nzcv_in = nzcv_values[nvi];
+
+		for (int op = LSE_LDADD; op <= LSE_CAS; op++) {
+			for (int sz = 0; sz <= 3; sz++) {
+				uint32_t insn = encode_lse(op, sz, 1, 1,
+				                           STD_RS, STD_RT, STD_RN);
+				uint32_t *fn_code = &code_base[code_offset];
+				int fn_size;
+				int lse_off = generate_nzcv_test_fn(fn_code,
+				    STD_RS, STD_RT, STD_RN, insn, &fn_size);
+				lse_emul_patch(&fn_code[lse_off], 4, &pool_cur, pool_end);
+				__builtin___clear_cache((char *)fn_code,
+				    (char *)(fn_code + fn_size));
+				__builtin___clear_cache((char *)pool_cur - POOL_SIZE,
+				    (char *)pool_cur);
+				code_offset += fn_size;
+
+				uint64_t mem __attribute__((aligned(16))) =
+				    (op == LSE_CAS) ? 0x42 : 0x100;
+				struct nzcv_test_params p = {
+					.addr = &mem,
+					.rs_val = (op == LSE_CAS) ? 0x42 : 0x1,
+					.rt_val = 0x99,
+					.nzcv_in = nzcv_in,
+					.nzcv_out = 0xDEADDEAD,
+				};
+
+				typedef void (*nzcv_fn_t)(struct nzcv_test_params *);
+				nzcv_fn_t fn = (nzcv_fn_t)fn_code;
+				fn(&p);
+
+				tests_run++;
+				char label[128];
+				snprintf(label, sizeof(label),
+				    "NZCV 0x%lX %s %s",
+				    (unsigned long)nzcv_in,
+				    op_names[op], size_names[sz]);
+				if (p.nzcv_out == nzcv_in) {
+					tests_passed++;
+				} else {
+					tests_failed++;
+					fprintf(stderr,
+					    "FAIL: %s — NZCV: got 0x%lX, expected 0x%lX\n",
+					    label,
+					    (unsigned long)p.nzcv_out,
+					    (unsigned long)nzcv_in);
+				}
+			}
+		}
+	}
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 
@@ -635,6 +755,7 @@ int main(void)
 
 	test_all_basic();
 	test_edge_cases();
+	test_nzcv_preservation();
 	test_contention();
 
 	printf("\n=== Results: %d/%d passed, %d failed ===\n",

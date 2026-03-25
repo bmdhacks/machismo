@@ -35,15 +35,19 @@ target_compile_definitions(machismo PRIVATE
     _GNU_SOURCE
 )
 target_link_libraries(machismo PRIVATE dl rt pthread m)
+target_link_options(machismo PRIVATE -rdynamic)
 
 # --- libsystem_shim.so ---
 
-add_library(system_shim SHARED src/shim/libsystem_shim.c)
+add_library(system_shim SHARED
+    src/shim/libsystem_shim.c
+    src/shim/heap_trace.c
+)
 set_target_properties(system_shim PROPERTIES
     OUTPUT_NAME "system_shim"
     PREFIX "lib"
 )
-target_compile_options(system_shim PRIVATE -Wall -O2 -g)
+target_compile_options(system_shim PRIVATE -Wall -O2 -g -fno-omit-frame-pointer)
 target_link_libraries(system_shim PRIVATE m pthread dl)
 target_link_options(system_shim PRIVATE
     -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/shim/libsystem_shim.ver
@@ -66,6 +70,22 @@ if(BUILD_TESTS)
     target_compile_definitions(test_lse_emul PRIVATE _GNU_SOURCE)
     target_link_libraries(test_lse_emul PRIVATE pthread)
 endif()
+
+# --- libgame_patches.so (NecroDancer-specific function replacements) ---
+
+add_library(necrodancer_patches SHARED
+    examples/necrodancer/src/game_patches.c
+)
+target_include_directories(necrodancer_patches PRIVATE
+    src                          # for stubs/apple_abi.h
+    examples/necrodancer/src     # for stubs/datastream.h
+)
+target_compile_options(necrodancer_patches PRIVATE -Wall -O2 -g)
+target_link_libraries(necrodancer_patches PRIVATE dl)
+set_target_properties(necrodancer_patches PROPERTIES
+    OUTPUT_NAME "game_patches"
+    PREFIX "lib"
+)
 
 # --- install ---
 

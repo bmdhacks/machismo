@@ -318,7 +318,7 @@ bool bgfx_init_wrapper(const void* _init)
 
 					void *egl_display = egl_get_display ? egl_get_display() : NULL;
 					void *egl_context = egl_get_context ? egl_get_context() : NULL;
-					void *egl_surface = egl_get_surface ? egl_get_surface(0x3060 /*EGL_DRAW*/) : NULL;
+					void *egl_surface = egl_get_surface ? egl_get_surface(0x3059 /*EGL_DRAW*/) : NULL;
 
 					*ndt = egl_display;
 					*nwh = egl_surface;
@@ -338,6 +338,35 @@ bool bgfx_init_wrapper(const void* _init)
 		} else {
 			fprintf(stderr, "bgfx_shim: SDL_GetWindowFromID(1) returned NULL\n");
 		}
+	}
+
+	/* Clamp transient buffer sizes.
+	 * The game's Init struct requests 8MB transient VB (RenderDoc shows only
+	 * 67KB actually used per frame).  On Mali with shared memory this is
+	 * catastrophic.  Clamp to match our build-time config.h overrides. */
+#define INIT_LIMITS_TRANSIENT_VB_OFFSET  92
+#define INIT_LIMITS_TRANSIENT_IB_OFFSET  96
+#define MAX_TRANSIENT_VB  (1<<20)    /* 1MB */
+#define MAX_TRANSIENT_IB  (64<<10)   /* 64KB */
+	uint32_t* tvb = (uint32_t*)(init_copy + INIT_LIMITS_TRANSIENT_VB_OFFSET);
+	uint32_t* tib = (uint32_t*)(init_copy + INIT_LIMITS_TRANSIENT_IB_OFFSET);
+	if (*tvb > MAX_TRANSIENT_VB) {
+		fprintf(stderr, "bgfx_shim: clamping transientVbSize %u -> %u\n", *tvb, MAX_TRANSIENT_VB);
+		*tvb = MAX_TRANSIENT_VB;
+	}
+	if (*tib > MAX_TRANSIENT_IB) {
+		fprintf(stderr, "bgfx_shim: clamping transientIbSize %u -> %u\n", *tib, MAX_TRANSIENT_IB);
+		*tib = MAX_TRANSIENT_IB;
+	}
+
+	/* Strip MSAA from resolution flags — Mali G31 can't afford the extra
+	 * full-resolution RGBA8 + depth textures for MSAA resolve. */
+#define INIT_RESOLUTION_RESET_OFFSET 76
+#define BGFX_RESET_MSAA_MASK 0x00000070
+	uint32_t* reset_flags = (uint32_t*)(init_copy + INIT_RESOLUTION_RESET_OFFSET);
+	if (*reset_flags & BGFX_RESET_MSAA_MASK) {
+		fprintf(stderr, "bgfx_shim: stripping MSAA from init resolution flags 0x%x\n", *reset_flags);
+		*reset_flags &= ~BGFX_RESET_MSAA_MASK;
 	}
 
 	/* Clear the game's callback and allocator pointers.
@@ -384,6 +413,12 @@ void bgfx_reset_wrapper(uint32_t width, uint32_t height, uint32_t flags, uint8_t
 		int dw = 0, dh = 0;
 		gl_drawable(captured_sdl_window, &dw, &dh);
 		fprintf(stderr, "bgfx_shim:   SDL_GL_GetDrawableSize = %dx%d\n", dw, dh);
+	}
+
+	/* Strip MSAA — can't afford extra resolve textures on Mali */
+	if (flags & BGFX_RESET_MSAA_MASK) {
+		fprintf(stderr, "bgfx_shim: stripping MSAA from reset flags 0x%x\n", flags);
+		flags &= ~BGFX_RESET_MSAA_MASK;
 	}
 
 	if (!real_bgfx_reset_fn) {

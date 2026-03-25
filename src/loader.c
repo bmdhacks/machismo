@@ -122,7 +122,6 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 		pie = true;
 	}
-no_slide:
 	(void)pie;
 
 	for (uint32_t i = 0, p = 0; i < header.ncmds && p < header.sizeofcmds; i++)

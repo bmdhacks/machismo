@@ -2,14 +2,17 @@
 # Test: libsystem_shim.so can be loaded and key Apple-specific symbols resolve
 set -e
 cd "$(dirname "$0")/.."
+MACHISMO_ROOT="${MACHISMO_ROOT:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-$MACHISMO_ROOT/build}"
 
-[ -f libsystem_shim.so ] || { echo "libsystem_shim.so not built"; exit 1; }
+[ -f "$BUILD_DIR/libsystem_shim.so" ] || { echo "libsystem_shim.so not built"; exit 1; }
 
 # Test that the .so loads without errors
-LD_LIBRARY_PATH=. python3 -c "
-import ctypes, sys
+BUILD_DIR="$BUILD_DIR" LD_LIBRARY_PATH="$BUILD_DIR" python3 -c "
+import ctypes, sys, os
 
-lib = ctypes.CDLL('./libsystem_shim.so')
+build_dir = os.environ['BUILD_DIR']
+lib = ctypes.CDLL(os.path.join(build_dir, 'libsystem_shim.so'))
 
 # mach_absolute_time should return a nonzero nanosecond timestamp
 lib.mach_absolute_time.restype = ctypes.c_uint64

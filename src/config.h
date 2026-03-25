@@ -31,6 +31,7 @@ typedef struct {
 	int num_prefixes;
 	int init_wrapper;                        /* intercept bgfx init */
 	char* renderer;                          /* force renderer type */
+	char* override_lib;                      /* .so with exact-symbol replacements */
 } machismo_trampoline_config_t;
 
 typedef struct {

@@ -148,7 +148,8 @@ static void* macho_eh_frame = NULL;
 static size_t macho_eh_frame_size = 0;
 static void* macho_eh_frame_hdr = NULL;
 static size_t macho_eh_frame_hdr_size = 0;
-static int (*real_dl_find_object)(void*, void*) = NULL;
+struct dl_find_object;
+static int (*real_dl_find_object)(void*, struct dl_find_object*) = NULL;
 
 /*
  * struct dl_find_object layout (glibc 2.35+):
@@ -165,9 +166,12 @@ static int (*real_dl_find_object)(void*, void*) = NULL;
 #define DLFO_EH_FRAME    32
 #define DLFO_SIZE        40
 
-/* Our interposed _dl_find_object */
-int _dl_find_object(void* pc, void* result)
+/* Our interposed _dl_find_object.
+ * Uses struct dl_find_object* to match glibc 2.35+ declaration in <dlfcn.h>.
+ * The struct is forward-declared above for older glibc that lacks it. */
+int _dl_find_object(void* pc, struct dl_find_object* result_ptr)
 {
+	void *result = (void *)result_ptr;
 	uintptr_t addr = (uintptr_t)pc;
 
 	/* Check if address is in the Mach-O __TEXT range */
@@ -182,7 +186,7 @@ int _dl_find_object(void* pc, void* result)
 
 	/* Fall through to real _dl_find_object for ELF objects */
 	if (real_dl_find_object)
-		return real_dl_find_object(pc, result);
+		return real_dl_find_object(pc, result_ptr);
 
 	return -1;  /* not found */
 }
@@ -719,8 +723,6 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 	uintptr_t text_base = 0;     /* __TEXT vmaddr (unslid) */
 	const uint8_t* unwind_info = NULL;
 	size_t unwind_size = 0;
-	const uint8_t* eh_frame_existing = NULL;
-	size_t eh_frame_existing_size = 0;
 
 	for (uint32_t i = 0; i < header->ncmds; i++) {
 		struct load_command* lc = (struct load_command*)cmd_ptr;
@@ -734,9 +736,6 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 					if (strcmp(sect->sectname, "__unwind_info") == 0) {
 						unwind_info = (const uint8_t*)(sect->addr + slide);
 						unwind_size = sect->size;
-					} else if (strcmp(sect->sectname, "__eh_frame") == 0) {
-						eh_frame_existing = (const uint8_t*)(sect->addr + slide);
-						eh_frame_existing_size = sect->size;
 					}
 				}
 			}
@@ -939,6 +938,20 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 		        hp, table_idx);
 	}
 
+	/* Register with __register_frame so the traditional unwinder path
+	 * (GCC <15 / glibc <2.35) can find our FDEs. This is the only
+	 * mechanism on older systems — _dl_find_object doesn't exist. */
+	{
+		void (*reg_frame)(const void *) = dlsym(RTLD_DEFAULT, "__register_frame");
+		if (reg_frame) {
+			reg_frame(ehf_buf);
+			fprintf(stderr, "eh_frame: registered %d FDEs via __register_frame\n",
+			        fdes_emitted);
+		} else {
+			fprintf(stderr, "eh_frame: WARNING: __register_frame not found\n");
+		}
+	}
+
 	/* Resolve real _dl_find_object from glibc.
 	 * Our interposed _dl_find_object (defined above) is called by libgcc_s
 	 * because the main executable's symbols take precedence over glibc's.
@@ -950,8 +963,8 @@ int eh_frame_register_macho(void* mh, uintptr_t slide)
 			fprintf(stderr, "eh_frame: _dl_find_object hook active for %p..%p\n",
 			        (void*)macho_text_start, (void*)macho_text_end);
 		else
-			fprintf(stderr, "eh_frame: WARNING: _dl_find_object not found, "
-			        "exception handling may not work\n");
+			fprintf(stderr, "eh_frame: using __register_frame only "
+			        "(no _dl_find_object in this glibc)\n");
 	}
 
 	return 0;

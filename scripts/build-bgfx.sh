@@ -42,6 +42,21 @@ BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_RENDERER_GNM=0"
 BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_RENDERER_NVN=0"
 BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_RENDERER_WEBGPU=0"
 
+# Memory reduction for Mali G31 (1GB shared RAM, no VRAM).
+# RenderDoc frame analysis: 3 draw calls, 67KB transient VB, 0 IB, 1 texture.
+# Defaults are tuned for desktop GPUs with GB of VRAM — wildly oversized here.
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_TRANSIENT_VERTEX_BUFFER_SIZE='(1<<20)'"     # 6MB → 1MB
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_TRANSIENT_INDEX_BUFFER_SIZE='(64<<10)'"     # 2MB → 64KB
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_DYNAMIC_VERTEX_BUFFER_SIZE='(128<<10)'"     # 3MB → 128KB
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_DYNAMIC_INDEX_BUFFER_SIZE='(64<<10)'"       # 1MB → 64KB
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_DRAW_CALLS=256"                         # 65535 → 256
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_TEXTURES=64"                            # 4096 → 64
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_VERTEX_BUFFERS=64"                      # 4096 → 64
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_INDEX_BUFFERS=64"                       # 4096 → 64
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_DYNAMIC_VERTEX_BUFFERS=16"              # 4096 → 16
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_MAX_DYNAMIC_INDEX_BUFFERS=16"               # 4096 → 16
+BGFX_DEFINES="$BGFX_DEFINES -DBGFX_CONFIG_DEFAULT_MAX_ENCODERS=1"                     # 8 → 1
+
 echo "=== Building bx ==="
 $CXX $CXXFLAGS $LIBCXX_INCLUDES $BX_INCLUDES -DBX_CONFIG_DEBUG=0 \
     -c extern/bx/src/amalgamated.cpp -o "$OUTDIR/bx.o"
@@ -60,7 +75,6 @@ BGFX_SRCS=(
     extern/bgfx/src/bgfx.cpp
     extern/bgfx/src/debug_renderdoc.cpp
     extern/bgfx/src/glcontext_egl.cpp
-    extern/bgfx/src/glcontext_glx.cpp
     extern/bgfx/src/renderer_gl.cpp
     extern/bgfx/src/renderer_noop.cpp
     extern/bgfx/src/shader.cpp
@@ -82,7 +96,7 @@ $CXX $CXXFLAGS $LIBCXX_INCLUDES $BGFX_INCLUDES -DBX_CONFIG_DEBUG=0 \
 echo "=== Linking libbgfx-shared.so ==="
 $CXX -shared -o "$OUTDIR/libbgfx-shared.so" \
     "$OUTDIR/bx.o" "$OUTDIR"/bimg_*.o "$OUTDIR"/bgfx_*.o "$OUTDIR/renderer_stubs.o" \
-    $LIBCXX_LINK -lEGL -lGLESv2 -lGL -lX11 -lpthread -ldl -lrt
+    $LIBCXX_LINK -lEGL -lGLESv2 -lpthread -ldl -lrt
 
 echo "=== Done ==="
 ls -lh "$OUTDIR/libbgfx-shared.so"

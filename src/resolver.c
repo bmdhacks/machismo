@@ -22,6 +22,36 @@
 #include <sys/mman.h>
 #include <errno.h>
 
+/* macOS malloc returns zero-initialized pages for most allocations.
+ * Game code depends on operator new returning zeroed memory.
+ * Hook _Znwm/_Znam (operator new/new[]) in the Mach-O GOT so only
+ * the game binary's allocations are zeroed — avoids the reentrancy
+ * issues of globally interposing malloc. */
+static void *(*shim_malloc_fn)(size_t) = NULL;
+static void (*shim_free_fn)(void *) = NULL;
+
+static void *zeroing_operator_new(size_t size)
+{
+	/* Call the shim's malloc (which does heap tracing) if loaded,
+	 * otherwise fall back to glibc malloc. */
+	void *p;
+	if (shim_malloc_fn)
+		p = shim_malloc_fn(size);
+	else {
+		p = malloc(size);
+		if (p) memset(p, 0, size);
+	}
+	return p;
+}
+
+static void zeroing_operator_delete(void *ptr)
+{
+	if (shim_free_fn)
+		shim_free_fn(ptr);
+	else
+		free(ptr);
+}
+
 /*
  * Try macOS ↔ Linux C++ mangling variants for the same function.
  * See trampoline.c for detailed rationale — combinatorial y↔m substitution.
@@ -493,6 +523,21 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file)
 		goto out;
 	}
 
+	/* Resolve shim's malloc/free for operator new/delete hooks.
+	 * Find the libSystem.B dylib entry — its handle is the shim .so.
+	 * Must use the specific handle, not RTLD_DEFAULT, since glibc's malloc
+	 * would be found first in the global search. */
+	if (!shim_malloc_fn) {
+		for (int i = 0; i < rs.ndylibs && i < MAX_DYLIBS; i++) {
+			if (rs.dylibs[i].action == DYLIB_MAP &&
+			    strstr(rs.dylibs[i].name, "libSystem")) {
+				shim_malloc_fn = (void *(*)(size_t))dlsym(rs.dylibs[i].handle, "malloc");
+				shim_free_fn = (void (*)(void *))dlsym(rs.dylibs[i].handle, "free");
+				break;
+			}
+		}
+	}
+
 	/* Step 4: Walk chained fixups and resolve */
 	if (process_chained_fixups(&rs) < 0) {
 		fprintf(stderr, "resolver: failed processing fixups\n");
@@ -640,8 +685,8 @@ static int load_mapping_config(struct resolver_state* rs, const char* path)
 		while (end > val && (*end == ' ' || *end == '\t')) *end-- = '\0';
 
 		struct dylib_mapping* m = &rs->mappings[rs->nmappings++];
-		strncpy(m->dylib_pattern, key, MAX_NAME - 1);
-		strncpy(m->so_path, val, MAX_NAME - 1);
+		snprintf(m->dylib_pattern, MAX_NAME, "%s", key);
+		snprintf(m->so_path, MAX_NAME, "%s", val);
 	}
 
 	fclose(f);
@@ -723,7 +768,7 @@ static int open_dylibs(struct resolver_state* rs)
 			continue;
 		}
 
-		strncpy(de->so_path, m->so_path, MAX_NAME - 1);
+		snprintf(de->so_path, MAX_NAME, "%s", m->so_path);
 		de->action = DYLIB_MAP;
 		fprintf(stderr, "resolver: dylib[%d] '%s' → '%s' — loaded\n",
 				de->ordinal, de->name, m->so_path);
@@ -874,6 +919,16 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 	if (strstr(sym_name, "registr") && strstr(sym_name, "s_instance") && !strstr(sym_name, "ZGV"))
 		fprintf(stderr, "resolver: TRACE s_instance: ordinal=%u lib_ordinal=%d weak=%d name='%s'\n",
 				ordinal, lib_ordinal, weak, sym_name);
+
+	/* Hook operator new/new[]/delete/delete[] for macOS malloc compat + heap tracing */
+	if (strcmp(sym_name, "__Znwm") == 0 || strcmp(sym_name, "__Znam") == 0) {
+		rs->binds_resolved++;
+		return (uintptr_t)zeroing_operator_new;
+	}
+	if (strcmp(sym_name, "__ZdlPv") == 0 || strcmp(sym_name, "__ZdaPv") == 0) {
+		rs->binds_resolved++;
+		return (uintptr_t)zeroing_operator_delete;
+	}
 
 	/* Special ordinals */
 	if (lib_ordinal == -1) {

@@ -195,6 +195,11 @@ struct macho_sym {
 	uint8_t  is_func;  /* 1 if text symbol */
 };
 
+/* Retained after gdb_jit_register_macho for runtime symbol lookup */
+static struct macho_sym *saved_syms = NULL;
+static char *saved_strtab = NULL;
+static int saved_nsyms = 0;
+
 static int sym_addr_cmp(const void *a, const void *b)
 {
 	const struct macho_sym *sa = (const struct macho_sym *)a;
@@ -517,10 +522,60 @@ int gdb_jit_register_macho(void* mh, uintptr_t slide)
 	fprintf(stderr, "gdb_jit: registered %d symbols (%d bytes ELF, code at %p-%p)\n",
 	        num_syms, w.pos, (void*)text_addr, (void*)(text_addr + text_size));
 
-	/* Clean up temporaries (NOT w.buf — owned by entry) */
-	free(syms);
-	free(strtab.buf);
+	/* Keep syms + strtab for runtime symbol lookup (heap_trace, etc.)
+	 * w.buf is owned by entry (GDB JIT), shstrtab is no longer needed. */
+	saved_syms = syms;
+	saved_strtab = strtab.buf;
+	saved_nsyms = num_syms;
 	free(shstrtab.buf);
 
 	return num_syms;
+}
+
+/* ========== Runtime symbol lookup ========== */
+
+const char *gdb_jit_lookup_addr(uintptr_t addr)
+{
+	if (!saved_syms || saved_nsyms == 0)
+		return NULL;
+
+	/* Binary search for the largest sym.addr <= addr */
+	int lo = 0, hi = saved_nsyms - 1;
+	int best = -1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (saved_syms[mid].addr <= addr) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	if (best < 0)
+		return NULL;
+
+	/* Check that addr is within a reasonable range of the symbol
+	 * (use next symbol's addr as upper bound, or 1MB max) */
+	uint64_t upper;
+	if (best + 1 < saved_nsyms)
+		upper = saved_syms[best + 1].addr;
+	else
+		upper = saved_syms[best].addr + (1 << 20);
+	if (addr >= upper)
+		return NULL;
+
+	return saved_strtab + saved_syms[best].strtab_offset;
+}
+
+uintptr_t gdb_jit_lookup_name(const char *name)
+{
+	if (!saved_syms || saved_nsyms == 0 || !name)
+		return 0;
+
+	for (int i = 0; i < saved_nsyms; i++) {
+		const char *sym = saved_strtab + saved_syms[i].strtab_offset;
+		if (strcmp(sym, name) == 0)
+			return saved_syms[i].addr;
+	}
+	return 0;
 }

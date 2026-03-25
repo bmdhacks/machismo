@@ -1,5 +1,11 @@
 GLIBC_2.17 {
     global:
+        malloc;
+        free;
+        calloc;
+        realloc;
+        heap_trace_set_symbol_resolver;
+        mmap_registry_add;
         pthread_mutex_lock;
         pthread_mutex_unlock;
         pthread_mutex_trylock;

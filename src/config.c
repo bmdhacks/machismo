@@ -76,6 +76,9 @@ int config_load(const char* path, machismo_config_t* cfg)
 			} else if (strcmp(key, "renderer") == 0) {
 				free(cur_tramp->renderer);
 				cur_tramp->renderer = strdup(val);
+			} else if (strcmp(key, "override_lib") == 0) {
+				free(cur_tramp->override_lib);
+				cur_tramp->override_lib = strdup(val);
 			}
 		} else {
 			/* [general] section or before any section */
@@ -101,6 +104,7 @@ void config_free(machismo_config_t* cfg)
 		free(cfg->trampolines[i].name);
 		free(cfg->trampolines[i].lib);
 		free(cfg->trampolines[i].renderer);
+		free(cfg->trampolines[i].override_lib);
 		for (int j = 0; j < cfg->trampolines[i].num_prefixes; j++)
 			free(cfg->trampolines[i].prefixes[j]);
 	}

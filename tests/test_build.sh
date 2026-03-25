@@ -1,6 +1,7 @@
 #!/bin/bash
-# Test: does make succeed?
+# Test: does cmake build succeed?
 set -e
 cd "$(dirname "$0")/.."
-make clean >/dev/null 2>&1
-make 2>&1
+MACHISMO_ROOT="${MACHISMO_ROOT:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-$MACHISMO_ROOT/build}"
+cmake --build "$BUILD_DIR" 2>&1

@@ -57,7 +57,7 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	elfcalls_make(&_elfcalls);
 
 	executable_buf[sizeof(executable_buf) - 1] = '\0';
-	strncpy(executable_buf, filepath, 4096);
+	strncpy(executable_buf, filepath, sizeof(executable_buf) - 1);
 	if (executable_buf[sizeof(executable_buf) - 1] != '\0')
 	{
 		fprintf(stderr, "File path was too big\n");
