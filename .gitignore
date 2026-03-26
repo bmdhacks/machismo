@@ -14,6 +14,7 @@ Makefile
 # External library builds
 build-bgfx/
 build-libcxx/
+build-luajit/
 build-sfml/
 
 # Test fixtures (built from source)
