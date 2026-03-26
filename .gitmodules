@@ -13,3 +13,6 @@
 [submodule "extern/llvm-project"]
 	path = extern/llvm-project
 	url = https://github.com/llvm/llvm-project.git
+[submodule "extern/LuaJIT"]
+	path = extern/LuaJIT
+	url = https://github.com/LuaJIT/LuaJIT.git

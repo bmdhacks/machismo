@@ -52,6 +52,113 @@ static void zeroing_operator_delete(void *ptr)
 		free(ptr);
 }
 
+/* ---- LuaJIT profiler hooks ----
+ *
+ * When MACHISMO_LUA_PROFILE is set, hook luaopen_jit/lua_close to inject
+ * LuaJIT's built-in profiler (jit.p).  Also supports MACHISMO_LUA_JITV for
+ * JIT verbose logging (shows which traces compile/abort).
+ *
+ * We hook luaopen_jit rather than luaL_openlibs because the game (via sol2)
+ * opens individual Lua libraries instead of calling luaL_openlibs.
+ *
+ * No LuaJIT headers needed — all calls go through dlsym'd function pointers.
+ */
+static int (*real_luaopen_jit)(void *L) = NULL;
+static void (*real_lua_close)(void *L) = NULL;
+
+/* Execute a Lua string via luaL_loadstring + lua_pcall (luaL_dostring is a macro).
+ * Returns 0 on success, non-zero on error (logs error to stderr). */
+static int lua_dostring(void *L, const char *s)
+{
+	static int (*ls)(void *, const char *) = NULL;
+	static int (*pc)(void *, int, int, int) = NULL;
+	static const char *(*tolstring)(void *, int, size_t *) = NULL;
+	static void (*settop)(void *, int) = NULL;
+
+	if (!ls) ls = dlsym(RTLD_DEFAULT, "luaL_loadstring");
+	if (!pc) pc = dlsym(RTLD_DEFAULT, "lua_pcall");
+	if (!tolstring) tolstring = dlsym(RTLD_DEFAULT, "lua_tolstring");
+	if (!settop) settop = dlsym(RTLD_DEFAULT, "lua_settop");
+	if (!ls || !pc) return -1;
+
+	int err = ls(L, s);
+	if (err == 0)
+		err = pc(L, 0, 0, 0);
+
+	if (err != 0) {
+		const char *msg = tolstring ? tolstring(L, -1, NULL) : NULL;
+		fprintf(stderr, "resolver: lua_dostring failed: %s\n",
+				msg ? msg : "(unknown error)");
+		if (settop) settop(L, -2);
+		return err;
+	}
+	return 0;
+}
+
+static void *profiled_lua_state = NULL;
+
+/* Hook luaopen_jit instead of luaL_openlibs: the game (via sol2) opens
+ * individual Lua libraries rather than calling luaL_openlibs.  luaopen_jit
+ * is called last in the standard order, after luaopen_package, so require()
+ * is available for loading jit.p. */
+static int wrapped_luaopen_jit(void *L)
+{
+	if (!real_luaopen_jit)
+		real_luaopen_jit = dlsym(RTLD_DEFAULT, "luaopen_jit");
+	int result = real_luaopen_jit(L);
+
+	/* Only start profiler on the first Lua state (the game's main state) */
+	if (profiled_lua_state)
+		return result;
+
+	const char *profile_path = getenv("MACHISMO_LUA_PROFILE");
+	if (profile_path) {
+		char lua_cmd[512];
+		snprintf(lua_cmd, sizeof(lua_cmd),
+			"require('jit.p').start('vFl', '%s')", profile_path);
+		if (lua_dostring(L, lua_cmd) == 0) {
+			profiled_lua_state = L;
+			fprintf(stderr, "resolver: LuaJIT profiler started -> %s\n", profile_path);
+		}
+	}
+
+	if (getenv("MACHISMO_LUA_JITV")) {
+		if (lua_dostring(L, "require('jit.v').start()") == 0)
+			fprintf(stderr, "resolver: LuaJIT verbose JIT logging enabled\n");
+	}
+
+	/* Run an arbitrary Lua script file for debugging/introspection */
+	const char *inject_path = getenv("MACHISMO_LUA_INJECT");
+	if (inject_path) {
+		int (*loadfile)(void *, const char *) = dlsym(RTLD_DEFAULT, "luaL_loadfile");
+		int (*pcall)(void *, int, int, int) = dlsym(RTLD_DEFAULT, "lua_pcall");
+		if (loadfile && pcall) {
+			if (loadfile(L, inject_path) == 0) {
+				pcall(L, 0, 0, 0);
+				fprintf(stderr, "resolver: injected Lua script %s\n", inject_path);
+			} else {
+				fprintf(stderr, "resolver: failed to load %s\n", inject_path);
+			}
+		}
+	}
+
+	return result;
+}
+
+static void wrapped_lua_close(void *L)
+{
+	if (L == profiled_lua_state) {
+		lua_dostring(L, "require('jit.p').stop()");
+		fprintf(stderr, "resolver: LuaJIT profiler stopped, output at %s\n",
+				getenv("MACHISMO_LUA_PROFILE"));
+		profiled_lua_state = NULL;
+	}
+
+	if (!real_lua_close)
+		real_lua_close = dlsym(RTLD_DEFAULT, "lua_close");
+	real_lua_close(L);
+}
+
 /*
  * Try macOS ↔ Linux C++ mangling variants for the same function.
  * See trampoline.c for detailed rationale — combinatorial y↔m substitution.
@@ -935,6 +1042,19 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 	if (strcmp(sym_name, "__ZdlPv") == 0 || strcmp(sym_name, "__ZdaPv") == 0) {
 		rs->binds_resolved++;
 		return (uintptr_t)zeroing_operator_delete;
+	}
+
+	/* Hook LuaJIT functions for profiler injection.
+	 * The game (via sol2) opens individual Lua libraries instead of calling
+	 * luaL_openlibs, so we hook luaopen_jit (last lib opened) to inject the
+	 * profiler, and lua_close to flush it. */
+	if (strcmp(sym_name, "_luaopen_jit") == 0) {
+		rs->binds_resolved++;
+		return (uintptr_t)wrapped_luaopen_jit;
+	}
+	if (strcmp(sym_name, "_lua_close") == 0) {
+		rs->binds_resolved++;
+		return (uintptr_t)wrapped_lua_close;
 	}
 
 	/* Special ordinals */
