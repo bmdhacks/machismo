@@ -14,6 +14,7 @@
 
 #include "resolver.h"
 #include "dylib_loader.h"
+#include "lua_entity_opt.h"
 #include "macho_defs.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +158,23 @@ static void wrapped_lua_close(void *L)
 	if (!real_lua_close)
 		real_lua_close = dlsym(RTLD_DEFAULT, "lua_close");
 	real_lua_close(L);
+}
+
+/* ---- Entity metamethod optimization hook ----
+ *
+ * Hook lua_pcall to attempt entity opt installation after the entity
+ * system is loaded.  Once installed, becomes a single not-taken branch. */
+static int (*real_lua_pcall)(void *L, int nargs, int nres, int errfunc) = NULL;
+static int entity_opt_installed = 0;
+
+static int wrapped_lua_pcall(void *L, int nargs, int nres, int errfunc)
+{
+	if (!real_lua_pcall)
+		real_lua_pcall = dlsym(RTLD_DEFAULT, "lua_pcall");
+	int result = real_lua_pcall(L, nargs, nres, errfunc);
+	if (__builtin_expect(!entity_opt_installed, 0))
+		entity_opt_installed = try_install_entity_opt(L);
+	return result;
 }
 
 /*
@@ -1055,6 +1073,10 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 	if (strcmp(sym_name, "_lua_close") == 0) {
 		rs->binds_resolved++;
 		return (uintptr_t)wrapped_lua_close;
+	}
+	if (strcmp(sym_name, "_lua_pcall") == 0) {
+		rs->binds_resolved++;
+		return (uintptr_t)wrapped_lua_pcall;
 	}
 
 	/* Special ordinals */

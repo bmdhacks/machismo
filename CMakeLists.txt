@@ -21,6 +21,7 @@ set(MACHISMO_SOURCES
     src/eh_frame.c
     src/dylib_loader.c
     src/lse_emul.c
+    src/lua_entity_opt.c
     src/elfcalls/elfcalls.c
     src/elfcalls/threads.c
 )
