@@ -29,7 +29,6 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <dirent.h>
-#include "heap_trace.h"
 
 /* ===== Mach time ===== */
 
@@ -100,14 +99,8 @@ static void init_stdio_globals(void)
 	__stdinp  = stdin;
 	__stdoutp = stdout;
 	__stderrp = stderr;
-	heap_trace_init();
 }
 
-__attribute__((destructor))
-static void fini_shim(void)
-{
-	heap_trace_close();
-}
 
 /* ===== errno ===== */
 
@@ -345,44 +338,6 @@ void memset_pattern16(void *dst, const void *pattern, size_t len)
 	if (len > 0) memcpy(d, p, len);
 }
 
-/* ===== Mach-O caller detection ===== */
-
-/*
- * When LD_PRELOAD'd, the shim intercepts ALL malloc/pthread calls globally.
- * macOS-compat behaviors (zero-init malloc, recursive mutex upgrade) must
- * only apply to Mach-O code — applying them to native .so code causes hangs.
- *
- * machismo registers Mach-O address ranges after loading. is_macho_caller()
- * checks __builtin_return_address(0) against these ranges.
- */
-
-#define MAX_MACHO_RANGES 16
-static struct { uintptr_t base; size_t size; } macho_ranges[MAX_MACHO_RANGES];
-static int macho_range_count = 0;
-
-void shim_register_macho_range(uintptr_t base, size_t size)
-{
-	if (macho_range_count < MAX_MACHO_RANGES) {
-		macho_ranges[macho_range_count].base = base;
-		macho_ranges[macho_range_count].size = size;
-		macho_range_count++;
-		fprintf(stderr, "libsystem_shim: registered Mach-O range %p-%p\n",
-		        (void *)base, (void *)(base + size));
-	}
-}
-
-static inline int is_macho_caller(void)
-{
-	uintptr_t ra = (uintptr_t)__builtin_extract_return_addr(
-	                   __builtin_return_address(0));
-	for (int i = 0; i < macho_range_count; i++) {
-		if (ra >= macho_ranges[i].base &&
-		    ra < macho_ranges[i].base + macho_ranges[i].size)
-			return 1;
-	}
-	return 0;
-}
-
 /* ===== pthread mutex ABI translation ===== */
 
 /*
@@ -466,12 +421,12 @@ static inline void fixup_mutex(pthread_mutex_t *mutex)
 
 int pthread_mutex_lock(pthread_mutex_t *mutex)
 {
-	fixup_mutex(mutex);  /* macOS signature detection — safe for all callers */
+	fixup_mutex(mutex);  /* macOS signature detection */
 	/* Upgrade zero-initialized (PTHREAD_MUTEX_INITIALIZER) mutexes to
-	 * recursive — but ONLY for Mach-O callers. macOS game code may re-lock
-	 * from the same thread (works on macOS, deadlocks on Linux).
-	 * Native code expects default non-recursive semantics. */
-	if (is_macho_caller()) {
+	 * recursive. macOS game code may re-lock from the same thread
+	 * (works on macOS, deadlocks on Linux). Without LD_PRELOAD,
+	 * only Mach-O code reaches these wrappers (via GOT patching). */
+	{
 		static const char zeros[sizeof(pthread_mutex_t)] = {0};
 		if (memcmp(mutex, zeros, sizeof(pthread_mutex_t)) == 0) {
 			pthread_mutexattr_t attr;
@@ -499,10 +454,8 @@ int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
 {
 	memset(mutex, 0, sizeof(pthread_mutex_t));
 	/* On macOS, PTHREAD_MUTEX_DEFAULT allows same-thread re-locking without
-	 * deadlock in some configurations. Make mutexes recursive to match
-	 * this behavior — but only for Mach-O callers. Native code expects
-	 * default non-recursive semantics. */
-	if (!attr && is_macho_caller()) {
+	 * deadlock in some configurations. Make mutexes recursive to match. */
+	if (!attr) {
 		pthread_mutexattr_t rattr;
 		pthread_mutexattr_init(&rattr);
 		pthread_mutexattr_settype(&rattr, PTHREAD_MUTEX_RECURSIVE);
@@ -1091,56 +1044,30 @@ int fstatat_darwin(int dirfd, const char *path, void *buf, int flags)
 /* Export under standard names so the resolver finds them when the game
  * imports stat/fstat/lstat from libSystem.B.dylib.
  * Use __asm__ labels to avoid conflicting with glibc's prototypes. */
-/* stat/fstat/lstat/fstatat: ABI translation for Mach-O callers only.
- * With LD_PRELOAD, native callers must get standard Linux behavior. */
-static int (*real_fstatat_fn)(int, const char *, struct stat *, int) = NULL;
-static int (*real_fstat_fn)(int, struct stat *) = NULL;
-
-static void resolve_real_stat(void)
-{
-	if (!real_fstatat_fn)
-		real_fstatat_fn = dlsym(RTLD_NEXT, "fstatat");
-	if (!real_fstat_fn)
-		real_fstat_fn = dlsym(RTLD_NEXT, "fstat");
-}
-
+/* Export under standard names so the resolver finds them when the game
+ * imports stat/fstat/lstat from libSystem.B.dylib. Only Mach-O code
+ * reaches these (via GOT patching), so unconditionally translate. */
 int shim_stat(const char *path, void *buf) __asm__("stat");
 int shim_stat(const char *path, void *buf)
 {
-	if (!is_macho_caller()) {
-		resolve_real_stat();
-		return real_fstatat_fn(AT_FDCWD, path, buf, 0);
-	}
 	return stat_darwin(path, buf);
 }
 
 int shim_fstat(int fd, void *buf) __asm__("fstat");
 int shim_fstat(int fd, void *buf)
 {
-	if (!is_macho_caller()) {
-		resolve_real_stat();
-		return real_fstat_fn(fd, buf);
-	}
 	return fstat_darwin(fd, buf);
 }
 
 int shim_lstat(const char *path, void *buf) __asm__("lstat");
 int shim_lstat(const char *path, void *buf)
 {
-	if (!is_macho_caller()) {
-		resolve_real_stat();
-		return real_fstatat_fn(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
-	}
 	return lstat_darwin(path, buf);
 }
 
 int shim_fstatat(int dirfd, const char *path, void *buf, int flags) __asm__("fstatat");
 int shim_fstatat(int dirfd, const char *path, void *buf, int flags)
 {
-	if (!is_macho_caller()) {
-		resolve_real_stat();
-		return real_fstatat_fn(dirfd, path, buf, flags);
-	}
 	return fstatat_darwin(dirfd, path, buf, flags);
 }
 
@@ -1187,25 +1114,15 @@ _Static_assert(sizeof(struct darwin_dirent) == 1048,
  */
 static __thread struct darwin_dirent tls_darwin_dirent;
 
-/* Resolve real glibc readdir/readdir_r via RTLD_NEXT.
- * Without this, LD_PRELOAD causes infinite recursion because our
- * readdir (exported via __asm__ label) interposes glibc's. */
-static struct dirent *(*real_readdir)(DIR *) = NULL;
-
 struct dirent *shim_readdir(DIR *dirp) __asm__("readdir");
 struct dirent *shim_readdir(DIR *dirp)
 {
-	if (!real_readdir)
-		real_readdir = dlsym(RTLD_NEXT, "readdir");
-	struct dirent *le = real_readdir(dirp);
+	struct dirent *le = readdir(dirp);
 	if (!le)
 		return NULL;
 
-	/* Native callers expect Linux dirent — pass through unchanged.
-	 * Only convert to darwin dirent for Mach-O callers. */
-	if (!is_macho_caller())
-		return le;
-
+	/* Convert to darwin dirent layout. Only Mach-O code reaches
+	 * this wrapper (via GOT patching), so always convert. */
 	struct darwin_dirent *de = &tls_darwin_dirent;
 	memset(de, 0, sizeof(*de));
 	de->d_ino     = le->d_ino;
@@ -1223,24 +1140,15 @@ struct dirent *shim_readdir(DIR *dirp)
 	return (struct dirent *)(void *)de;
 }
 
-static int (*real_readdir_r)(DIR *, struct dirent *, struct dirent **) = NULL;
-
 struct dirent *shim_readdir_r(DIR *dirp, void *entry, void **result) __asm__("readdir_r");
 struct dirent *shim_readdir_r(DIR *dirp, void *entry, void **result)
 {
-	if (!real_readdir_r)
-		real_readdir_r = dlsym(RTLD_NEXT, "readdir_r");
-
-	/* Native callers: pass through to real readdir_r unchanged */
-	if (!is_macho_caller())
-		return (struct dirent *)(intptr_t)real_readdir_r(dirp, entry, (struct dirent **)result);
-
 	/* readdir_r is deprecated but some Mach-O code uses it.
 	 * Convert into the caller's darwin_dirent buffer. */
 	struct dirent linux_entry;
 	struct dirent *linux_result = NULL;
 
-	int ret = real_readdir_r(dirp, &linux_entry, &linux_result);
+	int ret = readdir_r(dirp, &linux_entry, &linux_result);
 	if (ret != 0 || !linux_result) {
 		if (result) *(void**)result = NULL;
 		return (struct dirent *)(intptr_t)ret;
@@ -1306,12 +1214,11 @@ static size_t mmap_registry_remove(void *addr)
 /* ===== Heap allocation wrappers ===== */
 
 /* Intercept malloc/free/calloc/realloc for:
- * 1. Zero-initialization (macOS malloc compat)
- * 2. Heaptrack-compatible allocation tracing (MACHISMO_HEAPTRACK env var)
+ * 1. Zero-initialization (macOS malloc returns zeroed pages)
+ * 2. mmap registry (munmap instead of free for mmap'd regions)
  *
  * Uses dlsym(RTLD_NEXT) to find the real glibc functions.
- * The __asm__ labels export these under standard names so the resolver
- * finds them when the Mach-O imports from libSystem.B.dylib. */
+ * Only Mach-O code reaches these (via GOT patching). */
 
 typedef void *(*real_malloc_fn)(size_t);
 typedef void  (*real_free_fn)(void *);
@@ -1354,15 +1261,10 @@ void *shim_malloc(size_t size)
 			return NULL;
 		}
 	}
-	/* Zero-initialize only for Mach-O callers (macOS malloc returns zeroed pages).
-	 * Native callers get standard glibc malloc behavior + heap tracking. */
+	/* macOS malloc returns zeroed pages — zero-init for compatibility. */
 	void *p = real_malloc(size);
-	if (p) {
-		if (is_macho_caller())
-			memset(p, 0, size);
-		if (heap_trace_active)
-			heap_trace_alloc(p, size);
-	}
+	if (p)
+		memset(p, 0, size);
 	return p;
 }
 
@@ -1377,13 +1279,9 @@ void shim_free(void *ptr)
 	/* Check mmap registry: munmap instead of free for mmap'd regions */
 	size_t mmap_size = mmap_registry_remove(ptr);
 	if (mmap_size) {
-		if (heap_trace_active)
-			heap_trace_free(ptr);
 		munmap(ptr, mmap_size);
 		return;
 	}
-	if (heap_trace_active)
-		heap_trace_free(ptr);
 	if (!real_free) resolve_real_funcs();
 	if (real_free) real_free(ptr);
 }
@@ -1400,8 +1298,6 @@ void *shim_calloc(size_t nmemb, size_t size)
 		}
 	}
 	void *p = real_calloc(nmemb, size);
-	if (p && heap_trace_active)
-		heap_trace_alloc(p, nmemb * size);
 	return p;
 }
 
@@ -1411,7 +1307,5 @@ void *shim_realloc(void *ptr, size_t size)
 	if (!real_realloc) resolve_real_funcs();
 	if (!real_realloc) return NULL;
 	void *new_ptr = real_realloc(ptr, size);
-	if (heap_trace_active)
-		heap_trace_realloc(ptr, new_ptr, size);
 	return new_ptr;
 }

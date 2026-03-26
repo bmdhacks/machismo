@@ -39,7 +39,6 @@
 #include "eh_frame.h"
 #include "dylib_loader.h"
 #include "lse_emul.h"
-/* heap_trace lives in the shim .so — resolved via dlsym, no direct include needed */
 #include <sys/resource.h>
 #include <pthread.h>
 #include <sys/utsname.h>
@@ -609,32 +608,6 @@ int main(int argc, char** argv, char** envp)
 	if (machismo_load_results.mh) {
 		gdb_jit_register_macho((void*)machismo_load_results.mh,
 		                       machismo_load_results.slide);
-		/* Wire up heap_trace symbol resolution for Mach-O addresses.
-		 * heap_trace lives in the shim .so, so resolve via dlsym. */
-		typedef void (*set_resolver_fn)(const char *(*)(uintptr_t));
-		set_resolver_fn set_resolver = (set_resolver_fn)dlsym(
-			RTLD_DEFAULT, "heap_trace_set_symbol_resolver");
-		if (set_resolver)
-			set_resolver(gdb_jit_lookup_addr);
-
-		/* Register Mach-O address ranges with the shim so it can
-		 * distinguish Mach-O callers from native callers when
-		 * LD_PRELOAD'd (for conditional zero-init and pthread fixups). */
-		typedef void (*register_range_fn)(uintptr_t, size_t);
-		register_range_fn reg_range = (register_range_fn)dlsym(
-			RTLD_DEFAULT, "shim_register_macho_range");
-		if (reg_range) {
-			/* mh is the actual mapped header address (base + slide).
-			 * slide alone is the ASLR adjustment (0 when no relocation),
-			 * which would register a range starting from NULL. */
-			reg_range(machismo_load_results.mh,
-			          machismo_load_results.vm_addr_max -
-			          machismo_load_results.mh);
-			for (int i = 0; i < g_num_macho_dylibs; i++) {
-				reg_range(g_macho_dylibs[i].text_base,
-				          g_macho_dylibs[i].text_size);
-			}
-		}
 	}
 
 	/* Apply game-specific binary patches */

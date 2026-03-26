@@ -41,7 +41,6 @@ target_link_options(machismo PRIVATE -rdynamic)
 
 add_library(system_shim SHARED
     src/shim/libsystem_shim.c
-    src/shim/heap_trace.c
 )
 set_target_properties(system_shim PROPERTIES
     OUTPUT_NAME "system_shim"
