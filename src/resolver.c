@@ -779,11 +779,17 @@ static int open_dylibs(struct resolver_state* rs)
 
 /* ---- Make segment writable for patching ---- */
 
-static void make_segment_writable(struct resolver_state* rs, uintptr_t addr)
+static void make_segment_writable(struct resolver_state* rs, uintptr_t seg_base,
+                                   uint16_t page_count, uint16_t page_size)
 {
-	uintptr_t page = addr & ~(uintptr_t)0xFFF;
-	/* Make the page writable so we can patch pointers */
-	mprotect((void*)page, 0x4000, PROT_READ | PROT_WRITE);
+	long sys_page = sysconf(_SC_PAGESIZE);
+	uintptr_t start = seg_base & ~(uintptr_t)(sys_page - 1);
+	uintptr_t end = seg_base + (uintptr_t)page_count * page_size;
+	end = (end + sys_page - 1) & ~(uintptr_t)(sys_page - 1);
+	if (mprotect((void*)start, end - start, PROT_READ | PROT_WRITE) != 0) {
+		fprintf(stderr, "resolver: WARNING: mprotect(%p, 0x%lx) failed: %s\n",
+				(void*)start, (unsigned long)(end - start), strerror(errno));
+	}
 }
 
 /* ---- Process chained fixups ---- */
@@ -831,7 +837,8 @@ static int process_chained_fixups(struct resolver_state* rs)
 
 		/* Make the target segment writable for patching */
 		uintptr_t seg_base = rs->mh_addr + seg_starts->segment_offset;
-		make_segment_writable(rs, seg_base);
+		make_segment_writable(rs, seg_base, seg_starts->page_count,
+		                      seg_starts->page_size);
 
 		/* Walk each page */
 		for (uint16_t page = 0; page < seg_starts->page_count; page++) {
@@ -1021,10 +1028,13 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 			/* Wrap C++ ctors/dtors for Apple ARM64 ABI compatibility:
 			 * Apple ABI returns `this` in x0, Linux ABI returns void */
 			if (is_ctor_or_dtor(sym_name)) {
+				extern int machismo_verbose;
 				if (ctor_has_stack_params(sym_name)) {
-					fprintf(stderr, "resolver: ctor/dtor SKIP adapter (stack params): %s\n", sym_name);
+					if (machismo_verbose)
+						fprintf(stderr, "resolver: ctor/dtor SKIP adapter (stack params): %s\n", sym_name);
 				} else {
-					fprintf(stderr, "resolver: ctor/dtor ABI wrap: %s\n", sym_name);
+					if (machismo_verbose)
+						fprintf(stderr, "resolver: ctor/dtor ABI wrap: %s\n", sym_name);
 					result = wrap_ctor_for_apple_abi(result);
 				}
 			}

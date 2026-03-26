@@ -216,7 +216,19 @@ static void ip_table_grow(void)
 	ip_table_cap = new_cap;
 }
 
-static int intern_ip(void *addr)
+/*
+ * intern_ip_preresolved: intern an IP using pre-resolved dladdr results.
+ *
+ * dladdr() acquires the dynamic linker's internal dl_load_lock. If we called
+ * dladdr while holding trace_lock, and another thread held dl_load_lock and
+ * called malloc (→ heap_trace_alloc → trace_lock), we'd deadlock.
+ *
+ * Fix: callers pre-resolve via dladdr() BEFORE acquiring trace_lock, then
+ * pass the results here. Only intern_string/try_demangle run under the lock
+ * — these call malloc (safe: trace_recursion guard) but not dladdr.
+ */
+static int intern_ip_preresolved(void *addr, Dl_info *dl, int dl_valid,
+                                  const char *macho_sym)
 {
 	if (ip_table_count * 10 >= ip_table_cap * 7)
 		ip_table_grow();
@@ -235,23 +247,24 @@ static int intern_ip(void *addr)
 	int fn_idx = 0, file_idx = 0, line = 0;
 	int mod_idx = 0;
 
-	Dl_info info;
-	if (dladdr(addr, &info)) {
-		mod_idx = intern_string(info.dli_fname ? info.dli_fname : "??");
-		char *demangled = try_demangle(info.dli_sname);
-		fn_idx = intern_string(demangled ? demangled : (info.dli_sname ? info.dli_sname : "??"));
+	if (dl_valid < 0) {
+		/* Thread-local cache said "seen" but not in ip_table (cache collision).
+		 * We skipped dladdr — write raw address with unknown symbols. Rare. */
+		mod_idx = intern_string("??");
+		fn_idx = intern_string("??");
+		file_idx = intern_string("??");
+	} else if (dl_valid) {
+		mod_idx = intern_string(dl->dli_fname ? dl->dli_fname : "??");
+		char *demangled = try_demangle(dl->dli_sname);
+		fn_idx = intern_string(demangled ? demangled : (dl->dli_sname ? dl->dli_sname : "??"));
 		free(demangled);
 		file_idx = intern_string("??");
-		line = 0;
 	} else {
-		/* Address not in any ELF — likely Mach-O game code */
 		mod_idx = intern_string("macho");
-		const char *sym = sym_resolver ? sym_resolver((uintptr_t)addr) : NULL;
-		char *demangled = try_demangle(sym);
-		fn_idx = intern_string(demangled ? demangled : (sym ? sym : "??"));
+		char *demangled = try_demangle(macho_sym);
+		fn_idx = intern_string(demangled ? demangled : (macho_sym ? macho_sym : "??"));
 		free(demangled);
 		file_idx = intern_string("??");
-		line = 0;
 	}
 
 	trace_printf("i %lx %x %x %x %x\n",
@@ -594,6 +607,27 @@ void heap_trace_close(void)
 	fprintf(stderr, "heap_trace: closed (%d allocations recorded)\n", trace_alloc_count);
 }
 
+/* Direct-mapped IP cache.
+ * Avoids calling dladdr() for IPs we've already resolved — after warmup,
+ * 95%+ of frames are repeats from the same call sites. Without this cache,
+ * calling dladdr 64 times per allocation makes the game impossibly slow.
+ *
+ * Not __thread: TLS in LD_PRELOAD'd libraries has a small size limit (~4KB)
+ * and 8KB would cause stack smashing. A static cache has benign races —
+ * worst case is a redundant dladdr call, no correctness issue. */
+#define IP_CACHE_BITS 10
+#define IP_CACHE_SIZE (1 << IP_CACHE_BITS)
+static void *ip_cache[IP_CACHE_SIZE];
+
+static inline int ip_seen_recently(void *addr)
+{
+	unsigned int slot = hash_ptr(addr) & (IP_CACHE_SIZE - 1);
+	if (ip_cache[slot] == addr)
+		return 1;
+	ip_cache[slot] = addr;
+	return 0;
+}
+
 void heap_trace_alloc(void *ptr, size_t size)
 {
 	if (!trace_file || !ptr) return;
@@ -603,12 +637,36 @@ void heap_trace_alloc(void *ptr, size_t size)
 	void *frames[HEAP_TRACE_MAX_DEPTH];
 	int nframes = heap_trace_capture(frames, HEAP_TRACE_MAX_DEPTH);
 
+	/* Pre-resolve dladdr for NEW frames only, OUTSIDE the lock.
+	 * dladdr() acquires dl_load_lock internally — if we held trace_lock
+	 * while calling dladdr, and another thread held dl_load_lock and
+	 * called malloc (→ heap_trace_alloc → trace_lock), we'd deadlock.
+	 *
+	 * The thread-local cache avoids redundant dladdr calls for IPs
+	 * we've already resolved. dl_found[i] == -1 means "already cached,
+	 * skip dladdr". If a cache collision causes a miss, intern_ip_preresolved
+	 * falls back to unknown ("??") symbols — rare and harmless. */
+	Dl_info dl_info[HEAP_TRACE_MAX_DEPTH];
+	int dl_found[HEAP_TRACE_MAX_DEPTH];
+	const char *macho_syms[HEAP_TRACE_MAX_DEPTH];
+	for (int i = 0; i < nframes; i++) {
+		if (ip_seen_recently(frames[i])) {
+			dl_found[i] = -1;  /* already in ip_table (probably) */
+			macho_syms[i] = NULL;
+		} else {
+			dl_found[i] = dladdr(frames[i], &dl_info[i]);
+			macho_syms[i] = (!dl_found[i] && sym_resolver) ?
+				sym_resolver((uintptr_t)frames[i]) : NULL;
+		}
+	}
+
 	pthread_mutex_lock(&trace_lock);
 
 	/* Build trace tree: outermost to innermost */
 	int parent_trace = 0;
 	for (int i = nframes - 1; i >= 0; i--) {
-		int ip_idx = intern_ip(frames[i]);
+		int ip_idx = intern_ip_preresolved(frames[i],
+			&dl_info[i], dl_found[i], macho_syms[i]);
 		parent_trace = intern_trace(ip_idx, (uintptr_t)frames[i], parent_trace);
 	}
 

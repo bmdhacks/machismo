@@ -5,6 +5,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Pool space reserved adjacent to the Mach-O segments for branch islands.
+ * Guaranteed within ±128MB of __TEXT. Carved out by the LSE and trampoline
+ * code via machismo_pool_alloc(). */
+#define MACHISMO_POOL_PADDING (2 * 1024 * 1024)  /* 2MB */
+
 struct load_results {
 	unsigned long mh;
 	unsigned long entry_point;
@@ -29,6 +34,23 @@ struct load_results {
 	size_t envc;
 	char** argv;
 	char** envp;
+
+	/* Adjacent pool for branch islands (LSE emulation, trampolines) */
+	void* pool_base;
+	size_t pool_size;
+	size_t pool_used;
 };
+
+/* Allocate a chunk from the adjacent pool. Returns NULL if exhausted. */
+static inline void* machismo_pool_alloc(struct load_results* lr, size_t size)
+{
+	size_t page = 4096;
+	size_t aligned_off = (lr->pool_used + page - 1) & ~(page - 1);
+	if (!lr->pool_base || aligned_off + size > lr->pool_size)
+		return NULL;
+	void* ptr = (char*)lr->pool_base + aligned_off;
+	lr->pool_used = aligned_off + size;
+	return ptr;
+}
 
 #endif // _MACHISMO_LOADER_H_

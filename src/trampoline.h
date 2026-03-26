@@ -2,6 +2,14 @@
 #define _TRAMPOLINE_H_
 
 #include <stdint.h>
+#include <stddef.h>
+
+/*
+ * Provide a pre-allocated pool for branch islands.
+ * Must be called before any trampoline_patch_* function.
+ * The pool must be RWX and within ±128MB of the Mach-O __TEXT.
+ */
+void trampoline_set_pool(void* base, size_t size);
 
 /*
  * Override: redirect specific symbols to custom functions instead of dlsym.

@@ -34,6 +34,18 @@ cmake -S "$SRCDIR" -B "$BUILDDIR" \
 
 cmake --build "$BUILDDIR" -j$(nproc)
 
+# Strip X11 DT_NEEDED entries from graphics/window.
+# The game uses bgfx for rendering (not SFML's OpenGL backend), so the X11
+# code paths are never called. Removing the deps lets these .so files load
+# on KMSDRM handhelds that don't have X11 installed.
+if command -v patchelf >/dev/null 2>&1; then
+    for lib in "$BUILDDIR"/lib/libsfml-graphics.so.2.5.* "$BUILDDIR"/lib/libsfml-window.so.2.5.*; do
+        [ -f "$lib" ] || continue
+        patchelf --remove-needed libX11.so.6 --remove-needed libXrandr.so.2 "$lib" 2>/dev/null && \
+            echo "Stripped X11 deps from $(basename "$lib")"
+    done
+fi
+
 echo "=== SFML built ==="
 ls -lh "$BUILDDIR"/lib/libsfml-*.so*
 echo "libc++ linkage:"

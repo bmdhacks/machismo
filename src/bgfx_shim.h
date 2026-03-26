@@ -44,8 +44,8 @@ void bgfx_reset_wrapper(uint32_t width, uint32_t height, uint32_t flags, uint8_t
  * Use as trampoline override target for _SDL_CreateWindow. */
 void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, unsigned int flags);
 
-/* SDL_SetWindowFullscreen wrapper — blocks fullscreen transitions.
- * Use as trampoline override target for _SDL_SetWindowFullscreen. */
+/* SDL_SetWindowFullscreen wrapper — passes through to real SDL, then resets
+ * bgfx to match the new drawable size. */
 int sdl_set_window_fullscreen_wrapper(void* window, unsigned int flags);
 
 /* --- Diagnostic wrappers for camera/rendering offset investigation --- */
@@ -77,10 +77,5 @@ void bgfx_shim_set_real_encoder_submit(void* func);
 void bgfx_encoder_submit_wrapper(void* encoder, uint16_t id, uint64_t program_and_depth,
                                   uint32_t extra1, uint8_t flags);
 
-/* SDL_GetWindowSize wrapper — logs window dimensions for debugging. */
-void sdl_get_window_size_wrapper(void* window, int* w, int* h);
-
-/* SDL_GL_GetDrawableSize wrapper — logs drawable dimensions for debugging. */
-void sdl_gl_get_drawable_size_wrapper(void* window, int* w, int* h);
 
 #endif /* _BGFX_SHIM_H_ */

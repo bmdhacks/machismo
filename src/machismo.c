@@ -74,6 +74,8 @@ void* __machismo_main_stack_top = NULL;
 static int kernel_major = -1;
 static int kernel_minor = -1;
 
+int machismo_verbose = 0;
+
 int main(int argc, char** argv, char** envp)
 {
 	char *filename;
@@ -87,20 +89,36 @@ int main(int argc, char** argv, char** envp)
 	}
 	machismo_load_results.envp = envp;
 
-	if (argc < 2)
+	/* Parse machismo flags before the binary path */
+	int arg_idx = 1;
+	while (arg_idx < argc && argv[arg_idx][0] == '-') {
+		if (strcmp(argv[arg_idx], "-v") == 0 || strcmp(argv[arg_idx], "--verbose") == 0) {
+			machismo_verbose = 1;
+		} else if (strcmp(argv[arg_idx], "--") == 0) {
+			arg_idx++;
+			break;
+		} else {
+			fprintf(stderr, "Unknown option: %s\n", argv[arg_idx]);
+			fprintf(stderr, "Usage: %s [-v] <mach-o-binary> [args...]\n", argv[0]);
+			return 1;
+		}
+		arg_idx++;
+	}
+
+	if (arg_idx >= argc)
 	{
-		fprintf(stderr, "Usage: %s <mach-o-binary> [args...]\n", argv[0]);
+		fprintf(stderr, "Usage: %s [-v] <mach-o-binary> [args...]\n", argv[0]);
 		return 1;
 	}
 
-	filename = argv[1];
+	filename = argv[arg_idx];
 
 	/* Load the Mach-O binary */
 	load(filename, 0, false, argv, &machismo_load_results);
 
-	/* Adjust argv: remove our own argv[0] so the loaded binary sees its path as argv[0] */
-	machismo_load_results.argc = argc - 1;
-	machismo_load_results.argv = argv + 1;
+	/* Adjust argv: remove machismo args so the loaded binary sees its path as argv[0] */
+	machismo_load_results.argc = argc - arg_idx;
+	machismo_load_results.argv = argv + arg_idx;
 
 	/* Load config file — look next to the binary, or use MACHISMO_CONFIG */
 	machismo_config_t cfg = {0};
@@ -189,33 +207,15 @@ int main(int argc, char** argv, char** envp)
 			}
 			lp += llc->cmdsize;
 		}
-		/* Allocate 512KB pool near __TEXT for B range (±128MB).
-		 * Use MAP_FIXED_NOREPLACE with multiple fallback addresses,
-		 * same strategy as the trampoline island pool. */
+		/* Carve LSE pool from the adjacent pool reserved by the loader */
 		size_t lse_pool_size = 512 * 1024;
-		uintptr_t page_sz = sysconf(_SC_PAGESIZE);
-		uintptr_t lse_try[] = {
-			(text_end + page_sz - 1) & ~(page_sz - 1),
-			((text_end + 64*1024*1024) & ~(page_sz - 1)),
-			text_end >= lse_pool_size + page_sz ?
-				(text_end - lse_pool_size - 0x838000) & ~(page_sz - 1) : 0,
-		};
-		uint32_t* lse_pool = NULL;
-		for (int ti = 0; ti < (int)(sizeof(lse_try)/sizeof(lse_try[0])); ti++) {
-			if (lse_try[ti] == 0) continue;
-			lse_pool = (uint32_t*)mmap((void*)lse_try[ti], lse_pool_size,
-				PROT_READ | PROT_WRITE | PROT_EXEC,
-				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-				-1, 0);
-			if (lse_pool != MAP_FAILED) {
-				fprintf(stderr, "machismo: LSE island pool at %p (near __TEXT end %p)\n",
-				        lse_pool, (void*)text_end);
-				break;
-			}
-			lse_pool = NULL;
-		}
-		if (!lse_pool) {
-			fprintf(stderr, "machismo: WARNING: LSE pool mmap failed — LSE atomics will SIGILL\n");
+		uint32_t* lse_pool = (uint32_t*)machismo_pool_alloc(
+			&machismo_load_results, lse_pool_size);
+		if (lse_pool) {
+			fprintf(stderr, "machismo: LSE island pool at %p (adjacent to segments)\n",
+			        lse_pool);
+		} else {
+			fprintf(stderr, "machismo: WARNING: LSE pool alloc failed — LSE atomics will SIGILL\n");
 		}
 
 		lse_pool_cur = lse_pool;
@@ -325,12 +325,24 @@ int main(int argc, char** argv, char** envp)
 			uint32_t dp = 0;
 			int dfix = 0;
 
-			/* Find dylib text extent for island pool placement */
+			/* Find dylib text extent AND end of all segments.
+			 * __DATA/__LINKEDIT are mapped right after __TEXT, so the
+			 * island pool must go after ALL segments, not just __TEXT. */
 			uintptr_t dylib_text_end = 0;
+			uintptr_t dylib_vm_end = 0;
+			uintptr_t dylib_vm_start = (uintptr_t)-1;
 			for (uint32_t di = 0; di < dmh->ncmds && dp < dmh->sizeofcmds; di++) {
 				struct load_command *dlc = (struct load_command*)(dcmds + dp);
 				if (dlc->cmd == LC_SEGMENT_64) {
 					struct segment_command_64 *dseg = (struct segment_command_64*)dlc;
+					if (strcmp(dseg->segname, "__PAGEZERO") != 0) {
+						uintptr_t seg_start = dseg->vmaddr + mdi->slide;
+						uintptr_t seg_end = seg_start + dseg->vmsize;
+						if (seg_start < dylib_vm_start)
+							dylib_vm_start = seg_start;
+						if (seg_end > dylib_vm_end)
+							dylib_vm_end = seg_end;
+					}
 					if (dseg->maxprot & VM_PROT_EXECUTE) {
 						uintptr_t end = dseg->vmaddr + mdi->slide + dseg->vmsize;
 						if (end > dylib_text_end)
@@ -347,20 +359,53 @@ int main(int argc, char** argv, char** envp)
 			size_t dylib_pool_size = 64 * 1024;
 			uintptr_t dpg = sysconf(_SC_PAGESIZE);
 			if (dylib_text_end) {
-				uintptr_t try_addr = (dylib_text_end + dpg - 1) & ~(dpg - 1);
-				dylib_lse_pool = (uint32_t*)mmap((void*)try_addr, dylib_pool_size,
-					PROT_READ | PROT_WRITE | PROT_EXEC,
-					MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-				if (dylib_lse_pool == MAP_FAILED && mdi->slide >= dylib_pool_size + dpg) {
-					try_addr = (mdi->slide - dylib_pool_size) & ~(dpg - 1);
-					dylib_lse_pool = (uint32_t*)mmap((void*)try_addr, dylib_pool_size,
+				/* Try after all segments, then with gaps, then before */
+				uintptr_t try_addrs[] = {
+					(dylib_vm_end + dpg - 1) & ~(dpg - 1),
+					(dylib_vm_end + 1*1024*1024) & ~(dpg - 1),
+					(dylib_vm_end + 4*1024*1024) & ~(dpg - 1),
+					(dylib_vm_end + 16*1024*1024) & ~(dpg - 1),
+					dylib_vm_start >= dylib_pool_size + dpg
+						? (dylib_vm_start - dylib_pool_size) & ~(dpg - 1) : 0,
+					dylib_vm_start >= dylib_pool_size + 4*1024*1024
+						? (dylib_vm_start - dylib_pool_size - 4*1024*1024) & ~(dpg - 1) : 0,
+				};
+				for (int ti = 0; ti < (int)(sizeof(try_addrs)/sizeof(try_addrs[0])); ti++) {
+					if (try_addrs[ti] == 0) continue;
+					dylib_lse_pool = (uint32_t*)mmap((void*)try_addrs[ti], dylib_pool_size,
 						PROT_READ | PROT_WRITE | PROT_EXEC,
 						MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+					if (dylib_lse_pool != MAP_FAILED) {
+						if ((uintptr_t)dylib_lse_pool != try_addrs[ti]) {
+							munmap(dylib_lse_pool, dylib_pool_size);
+							dylib_lse_pool = MAP_FAILED;
+							continue;
+						}
+						break;
+					}
+				}
+				/* Last resort: let kernel choose, verify ±128MB range */
+				if (!dylib_lse_pool || dylib_lse_pool == MAP_FAILED) {
+					dylib_lse_pool = (uint32_t*)mmap((void*)dylib_vm_end, dylib_pool_size,
+						PROT_READ | PROT_WRITE | PROT_EXEC,
+						MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+					if (dylib_lse_pool != MAP_FAILED) {
+						int64_t dist = (int64_t)((uintptr_t)dylib_lse_pool - dylib_text_end);
+						if (dist > 0x07FFFFFF || dist < -0x08000000) {
+							fprintf(stderr, "machismo: LSE pool for '%s' too far (dist=0x%lx), unmapping\n",
+							        mdi->path, (unsigned long)dist);
+							munmap(dylib_lse_pool, dylib_pool_size);
+							dylib_lse_pool = MAP_FAILED;
+						}
+					}
 				}
 				if (dylib_lse_pool != MAP_FAILED && dylib_lse_pool != NULL) {
 					dylib_lse_cur = dylib_lse_pool;
 					dylib_lse_end = dylib_lse_pool + dylib_pool_size / 4;
 				} else {
+					fprintf(stderr, "machismo: WARNING: LSE pool alloc failed for dylib '%s'"
+					        " (vm_end=%p) — LSE atomics will SIGILL\n",
+					        mdi->path, (void*)dylib_vm_end);
 					dylib_lse_pool = NULL;
 				}
 			}
@@ -433,6 +478,16 @@ int main(int argc, char** argv, char** envp)
 
 	/* Apply trampolines from config */
 	if (machismo_load_results.mh) {
+		/* Give the trampoline system its share of the adjacent pool (1MB) */
+		size_t tramp_pool_size = 1024 * 1024;
+		void* tramp_pool = machismo_pool_alloc(
+			&machismo_load_results, tramp_pool_size);
+		if (tramp_pool) {
+			trampoline_set_pool(tramp_pool, tramp_pool_size);
+		} else {
+			fprintf(stderr, "machismo: WARNING: no pool space for trampoline islands\n");
+		}
+
 		for (int i = 0; i < cfg.num_trampolines; i++) {
 			machismo_trampoline_config_t* tc = &cfg.trampolines[i];
 
@@ -455,21 +510,17 @@ int main(int argc, char** argv, char** envp)
 			trampoline_override_t* overrides = NULL;
 			int num_overrides = 0;
 
-			/* SDL-specific: capture window + block fullscreen + diagnostics */
+			/* SDL-specific: capture window + resize bgfx on fullscreen */
 			for (int j = 0; j < tc->num_prefixes; j++) {
 				if (strcmp(tc->prefixes[j], "_SDL_") == 0) {
 					static trampoline_override_t sdl_ov[] = {
 						{ "_SDL_CreateWindow", NULL },
 						{ "_SDL_SetWindowFullscreen", NULL },
-						{ "_SDL_GetWindowSize", NULL },
-						{ "_SDL_GL_GetDrawableSize", NULL },
 					};
 					sdl_ov[0].target = (void*)sdl_create_window_wrapper;
 					sdl_ov[1].target = (void*)sdl_set_window_fullscreen_wrapper;
-					sdl_ov[2].target = (void*)sdl_get_window_size_wrapper;
-					sdl_ov[3].target = (void*)sdl_gl_get_drawable_size_wrapper;
 					overrides = sdl_ov;
-					num_overrides = 4;
+					num_overrides = 2;
 					break;
 				}
 			}
@@ -565,6 +616,25 @@ int main(int argc, char** argv, char** envp)
 			RTLD_DEFAULT, "heap_trace_set_symbol_resolver");
 		if (set_resolver)
 			set_resolver(gdb_jit_lookup_addr);
+
+		/* Register Mach-O address ranges with the shim so it can
+		 * distinguish Mach-O callers from native callers when
+		 * LD_PRELOAD'd (for conditional zero-init and pthread fixups). */
+		typedef void (*register_range_fn)(uintptr_t, size_t);
+		register_range_fn reg_range = (register_range_fn)dlsym(
+			RTLD_DEFAULT, "shim_register_macho_range");
+		if (reg_range) {
+			/* mh is the actual mapped header address (base + slide).
+			 * slide alone is the ASLR adjustment (0 when no relocation),
+			 * which would register a range starting from NULL. */
+			reg_range(machismo_load_results.mh,
+			          machismo_load_results.vm_addr_max -
+			          machismo_load_results.mh);
+			for (int i = 0; i < g_num_macho_dylibs; i++) {
+				reg_range(g_macho_dylibs[i].text_base,
+				          g_macho_dylibs[i].text_size);
+			}
+		}
 	}
 
 	/* Apply game-specific binary patches */
@@ -915,10 +985,12 @@ static void run_init_offsets(struct load_results* lr) {
 					int count = sect->size / sizeof(uint32_t);
 					fprintf(stderr, "machismo: running %d C++ static initializers from __init_offsets\n", count);
 					typedef void (*init_func_t)(void);
+					extern int machismo_verbose;
 					for (int j = 0; j < count; j++) {
 						uintptr_t func_addr = lr->mh + offsets[j];
 						init_func_t func = (init_func_t)func_addr;
-						fprintf(stderr, "machismo: init[%d/%d] at 0x%lx\n", j, count, func_addr);
+						if (machismo_verbose)
+							fprintf(stderr, "machismo: init[%d/%d] at 0x%lx\n", j, count, func_addr);
 						func();
 					}
 					fprintf(stderr, "machismo: static initializers complete\n");
@@ -1015,21 +1087,21 @@ static bool is_kernel_at_least(int major, int minor) {
 }
 
 void* compatible_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-	bool fixed_noreplace_hack = false;
 	if ((flags & MAP_FIXED_NOREPLACE) && !is_kernel_at_least(4, 17)) {
+		/* Kernel lacks MAP_FIXED_NOREPLACE (added 4.17).
+		 * For non-NULL addr: use MAP_FIXED — the PIE probe already verified
+		 * this range is available, so clobbering is safe.
+		 * For NULL addr (e.g. __PAGEZERO): just fail — we can't force addr 0
+		 * and a hint-based mmap won't return it. */
 		flags &= ~MAP_FIXED_NOREPLACE;
-		fixed_noreplace_hack = true;
+		if (addr != NULL)
+			flags |= MAP_FIXED;
+		/* else: non-fixed, will likely return a different address and caller
+		 * handles the failure (vmaddr==0 && prot==0 → skip). */
 	}
 	void* result = mmap(addr, length, prot, flags, fd, offset);
 	if ((result == (void*)MAP_FAILED) && (flags & MAP_GROWSDOWN) && (errno == EOPNOTSUPP)) {
 		result = mmap(addr, length, prot, (flags & ~MAP_GROWSDOWN), fd, offset);
-	}
-	if (fixed_noreplace_hack) {
-		if (result != addr && result != (void*)MAP_FAILED) {
-			errno = ESRCH;
-			munmap(addr, length);
-			return MAP_FAILED;
-		}
 	}
 	return result;
 }

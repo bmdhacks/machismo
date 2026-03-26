@@ -66,8 +66,10 @@ static void* (*sdl_GetWindowFromID)(uint32_t id) = NULL;
 static int (*sdl_GetWindowWMInfo)(SDL_Window*, void* info) = NULL;
 static void (*sdl_GetVersion)(SDL_version_t* ver) = NULL;
 static void (*sdl_GetWindowSize)(void*, int*, int*) = NULL;
+static void (*sdl_GL_GetDrawableSize)(void*, int*, int*) = NULL;
 
 static void* real_bgfx_init_fn = NULL;
+static void* real_bgfx_reset_fn = NULL;
 static void* real_bgfx_frame_fn = NULL;
 static int forced_renderer_type = BGFX_V118_TYPE_OPENGLES;
 
@@ -117,10 +119,23 @@ static void resolve_sdl_funcs(void)
 	sdl_GetWindowWMInfo = dlsym(RTLD_DEFAULT, "SDL_GetWindowWMInfo");
 	sdl_GetVersion = dlsym(RTLD_DEFAULT, "SDL_GetVersion");
 	sdl_GetWindowSize = dlsym(RTLD_DEFAULT, "SDL_GetWindowSize");
+	sdl_GL_GetDrawableSize = dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
 
 	if (!sdl_GetWindowFromID || !sdl_GetWindowWMInfo) {
 		fprintf(stderr, "bgfx_shim: warning: SDL2 functions not found, "
 		        "cannot get native window handle\n");
+	}
+}
+
+/* Get actual framebuffer size (physical pixels), falling back to window size */
+static void get_drawable_size(void* window, int* w, int* h)
+{
+	*w = 0; *h = 0;
+	if (sdl_GL_GetDrawableSize)
+		sdl_GL_GetDrawableSize(window, w, h);
+	if (*w <= 0 || *h <= 0) {
+		if (sdl_GetWindowSize)
+			sdl_GetWindowSize(window, w, h);
 	}
 }
 
@@ -181,52 +196,41 @@ void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, u
 #define SDL_WINDOW_FULLSCREEN_DESKTOP 0x00001001
 #define SDL_WINDOW_ALLOW_HIGHDPI      0x00002000
 	/* Detect KMSDRM: check SDL_VIDEODRIVER or absence of DISPLAY/WAYLAND.
-	 * On KMSDRM, fullscreen is the only valid mode — stripping it breaks
-	 * EGL surface creation. On X11/Wayland, strip fullscreen for dev. */
+	 * On KMSDRM, fullscreen is the only valid mode for EGL surface creation. */
 	const char *video_drv = getenv("SDL_VIDEODRIVER");
 	int is_kmsdrm = (video_drv && strcmp(video_drv, "KMSDRM") == 0)
 	             || (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY"));
-	if (!is_kmsdrm && (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP))) {
-		fprintf(stderr, "bgfx_shim: stripping fullscreen flags 0x%x\n", flags);
-		flags &= ~(SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP);
-	}
 	if (is_kmsdrm) {
-		/* Force FULLSCREEN_DESKTOP on KMSDRM for proper EGL surface */
 		flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 		fprintf(stderr, "bgfx_shim: KMSDRM detected, forcing fullscreen\n");
 	}
-	/* Strip ALLOW_HIGHDPI — prevents drawable/window size mismatch. */
-	if (flags & SDL_WINDOW_ALLOW_HIGHDPI) {
-		fprintf(stderr, "bgfx_shim: stripping SDL_WINDOW_ALLOW_HIGHDPI\n");
-		flags &= ~SDL_WINDOW_ALLOW_HIGHDPI;
-	}
+	/* Keep ALLOW_HIGHDPI — the game was built for Retina displays and
+	 * handles HiDPI itself. Stripping it causes a drawable/logical size
+	 * mismatch on HiDPI screens (bgfx renders at logical size into a
+	 * physical-size surface, showing only a quarter of the frame). */
 	void* win = real_fn(title, x, y, w, h, flags);
 	if (win) {
 		captured_sdl_window = win;
-		fprintf(stderr, "bgfx_shim: captured SDL window %p (requested %dx%d, flags=0x%x)\n",
-		        win, w, h, flags);
-		/* Log actual sizes for HiDPI debugging */
-		if (sdl_GetWindowSize) {
-			int ww = 0, wh = 0;
-			sdl_GetWindowSize(win, &ww, &wh);
-			fprintf(stderr, "bgfx_shim: SDL_GetWindowSize = %dx%d\n", ww, wh);
-		}
-		typedef void (*sdl_gl_get_drawable_fn)(void*, int*, int*);
-		sdl_gl_get_drawable_fn gl_drawable =
-			(sdl_gl_get_drawable_fn)dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
-		if (gl_drawable) {
-			int dw = 0, dh = 0;
-			gl_drawable(win, &dw, &dh);
-			fprintf(stderr, "bgfx_shim: SDL_GL_GetDrawableSize = %dx%d\n", dw, dh);
-		}
+		if (!sdl_GetWindowSize)
+			sdl_GetWindowSize = dlsym(RTLD_DEFAULT, "SDL_GetWindowSize");
+		if (!sdl_GL_GetDrawableSize)
+			sdl_GL_GetDrawableSize = dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
+		int ww = 0, wh = 0;
+		get_drawable_size(win, &ww, &wh);
+		fprintf(stderr, "bgfx_shim: captured SDL window %p (%dx%d, flags=0x%x)\n",
+		        win, ww, wh, flags);
 	}
 	return win;
 }
 
 int sdl_set_window_fullscreen_wrapper(void* window, uint32_t flags)
 {
-	fprintf(stderr, "bgfx_shim: blocking SDL_SetWindowFullscreen(flags=0x%x)\n", flags);
+	/* Block fullscreen transitions. On macOS, fullscreen changes the display
+	 * mode to match the game's resolution (960x540). On Linux/Wayland, the
+	 * display mode can't change, so fullscreen gives us a native-res surface
+	 * while the game's viewports/cameras stay at 960x540 — broken. */
 	(void)window;
+	fprintf(stderr, "bgfx_shim: blocked SDL_SetWindowFullscreen(0x%x)\n", flags);
 	return 0;
 }
 
@@ -244,8 +248,6 @@ bool bgfx_init_wrapper(const void* _init)
 
 	/* Force renderer type */
 	uint32_t* type_ptr = (uint32_t*)(init_copy + INIT_TYPE_OFFSET);
-	fprintf(stderr, "bgfx_shim: original renderer type = %u, forcing %d\n",
-	        *type_ptr, forced_renderer_type);
 	*type_ptr = forced_renderer_type;
 
 	/* Fix platform data — get real X11 window handle */
@@ -357,24 +359,32 @@ bool bgfx_init_wrapper(const void* _init)
 #define MAX_TRANSIENT_IB  (64<<10)   /* 64KB */
 	uint32_t* tvb = (uint32_t*)(init_copy + INIT_LIMITS_TRANSIENT_VB_OFFSET);
 	uint32_t* tib = (uint32_t*)(init_copy + INIT_LIMITS_TRANSIENT_IB_OFFSET);
-	if (*tvb > MAX_TRANSIENT_VB) {
-		fprintf(stderr, "bgfx_shim: clamping transientVbSize %u -> %u\n", *tvb, MAX_TRANSIENT_VB);
-		*tvb = MAX_TRANSIENT_VB;
-	}
-	if (*tib > MAX_TRANSIENT_IB) {
-		fprintf(stderr, "bgfx_shim: clamping transientIbSize %u -> %u\n", *tib, MAX_TRANSIENT_IB);
-		*tib = MAX_TRANSIENT_IB;
+	if (*tvb > MAX_TRANSIENT_VB) *tvb = MAX_TRANSIENT_VB;
+	if (*tib > MAX_TRANSIENT_IB) *tib = MAX_TRANSIENT_IB;
+
+	/* Override init resolution to match actual drawable size (physical pixels) */
+#define INIT_RESOLUTION_FORMAT_OFFSET 64
+#define INIT_RESOLUTION_WIDTH_OFFSET  68
+#define INIT_RESOLUTION_HEIGHT_OFFSET 72
+#define INIT_RESOLUTION_RESET_OFFSET  76
+#define BGFX_RESET_MSAA_MASK 0x00000070
+	if (captured_sdl_window) {
+		int ww = 0, wh = 0;
+		get_drawable_size(captured_sdl_window, &ww, &wh);
+		uint32_t* res_w = (uint32_t*)(init_copy + INIT_RESOLUTION_WIDTH_OFFSET);
+		uint32_t* res_h = (uint32_t*)(init_copy + INIT_RESOLUTION_HEIGHT_OFFSET);
+		if (ww > 0 && wh > 0 && (*res_w != (uint32_t)ww || *res_h != (uint32_t)wh)) {
+			fprintf(stderr, "bgfx_shim: init resolution %ux%u -> %dx%d (matching window)\n",
+			        *res_w, *res_h, ww, wh);
+			*res_w = ww;
+			*res_h = wh;
+		}
 	}
 
 	/* Strip MSAA from resolution flags — Mali G31 can't afford the extra
 	 * full-resolution RGBA8 + depth textures for MSAA resolve. */
-#define INIT_RESOLUTION_RESET_OFFSET 76
-#define BGFX_RESET_MSAA_MASK 0x00000070
 	uint32_t* reset_flags = (uint32_t*)(init_copy + INIT_RESOLUTION_RESET_OFFSET);
-	if (*reset_flags & BGFX_RESET_MSAA_MASK) {
-		fprintf(stderr, "bgfx_shim: stripping MSAA from init resolution flags 0x%x\n", *reset_flags);
-		*reset_flags &= ~BGFX_RESET_MSAA_MASK;
-	}
+	*reset_flags &= ~BGFX_RESET_MSAA_MASK;
 
 	/* Clear the game's callback and allocator pointers.
 	 * The game's callback is a Mach-O object whose cacheReadSize/cacheRead
@@ -385,7 +395,6 @@ bool bgfx_init_wrapper(const void* _init)
 #define INIT_ALLOCATOR_OFFSET 112
 	void** cb  = (void**)(init_copy + INIT_CALLBACK_OFFSET);
 	void** alloc = (void**)(init_copy + INIT_ALLOCATOR_OFFSET);
-	fprintf(stderr, "bgfx_shim: clearing game callback=%p allocator=%p\n", *cb, *alloc);
 	*cb = NULL;
 	*alloc = NULL;
 
@@ -394,8 +403,6 @@ bool bgfx_init_wrapper(const void* _init)
 	return ((bgfx_init_fn)real_bgfx_init_fn)(init_copy);
 }
 
-static void* real_bgfx_reset_fn = NULL;
-
 void bgfx_shim_set_real_reset(void* func)
 {
 	real_bgfx_reset_fn = func;
@@ -403,29 +410,21 @@ void bgfx_shim_set_real_reset(void* func)
 
 void bgfx_reset_wrapper(uint32_t width, uint32_t height, uint32_t flags, uint8_t format)
 {
-	fprintf(stderr, "bgfx_shim: bgfx::reset(%u x %u, flags=0x%x, fmt=%u)\n",
-	        width, height, flags, format);
-
-	/* Log SDL sizes for comparison */
-	resolve_sdl_funcs();
-	if (sdl_GetWindowSize && captured_sdl_window) {
-		int ww = 0, wh = 0;
-		sdl_GetWindowSize(captured_sdl_window, &ww, &wh);
-		fprintf(stderr, "bgfx_shim:   SDL_GetWindowSize = %dx%d\n", ww, wh);
-	}
-	typedef void (*sdl_gl_get_drawable_fn)(void*, int*, int*);
-	sdl_gl_get_drawable_fn gl_drawable =
-		(sdl_gl_get_drawable_fn)dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
-	if (gl_drawable && captured_sdl_window) {
-		int dw = 0, dh = 0;
-		gl_drawable(captured_sdl_window, &dw, &dh);
-		fprintf(stderr, "bgfx_shim:   SDL_GL_GetDrawableSize = %dx%d\n", dw, dh);
-	}
-
 	/* Strip MSAA — can't afford extra resolve textures on Mali */
-	if (flags & BGFX_RESET_MSAA_MASK) {
-		fprintf(stderr, "bgfx_shim: stripping MSAA from reset flags 0x%x\n", flags);
-		flags &= ~BGFX_RESET_MSAA_MASK;
+	flags &= ~BGFX_RESET_MSAA_MASK;
+
+	/* Override resolution to match actual drawable size. The game hardcodes
+	 * its internal resolution but the display may be different (e.g. 640x480
+	 * handheld vs game's 960x540, or HiDPI scaling). */
+	if (captured_sdl_window) {
+		int ww = 0, wh = 0;
+		get_drawable_size(captured_sdl_window, &ww, &wh);
+		if (ww > 0 && wh > 0 && ((uint32_t)ww != width || (uint32_t)wh != height)) {
+			fprintf(stderr, "bgfx_shim: reset %ux%u -> %dx%d (matching window)\n",
+			        width, height, ww, wh);
+			width = ww;
+			height = wh;
+		}
 	}
 
 	if (!real_bgfx_reset_fn) {
@@ -527,12 +526,6 @@ void bgfx_shim_set_real_get_caps(void* func)
 void bgfx_set_view_rect_wrapper(uint16_t id, uint16_t x, uint16_t y,
                                  uint16_t width, uint16_t height)
 {
-	static int log_count = 0;
-	if (log_count < 200) {
-		fprintf(stderr, "bgfx_shim: setViewRect(view=%u, x=%u, y=%u, w=%u, h=%u)\n",
-		        id, x, y, width, height);
-		log_count++;
-	}
 	typedef void (*fn_t)(uint16_t, uint16_t, uint16_t, uint16_t, uint16_t);
 	((fn_t)real_bgfx_set_view_rect_fn)(id, x, y, width, height);
 }
@@ -570,21 +563,6 @@ const void* bgfx_get_caps_wrapper(void)
 	return caps;
 }
 
-void sdl_get_window_size_wrapper(void* window, int* w, int* h)
-{
-	typedef void (*fn_t)(void*, int*, int*);
-	static fn_t real_fn = NULL;
-	if (!real_fn)
-		real_fn = (fn_t)dlsym(RTLD_DEFAULT, "SDL_GetWindowSize");
-	if (real_fn)
-		real_fn(window, w, h);
-	static int log_count = 0;
-	if (log_count < 30) {
-		fprintf(stderr, "bgfx_shim: SDL_GetWindowSize -> %dx%d\n",
-		        w ? *w : -1, h ? *h : -1);
-		log_count++;
-	}
-}
 
 /* Encoder::setTransform wrapper — logs model matrices.
  * C++ member function: this=encoder, _mtx=matrix, _num=count.
@@ -598,17 +576,6 @@ void bgfx_shim_set_real_encoder_set_transform(void* func)
 
 uint32_t bgfx_encoder_set_transform_wrapper(void* encoder, const void* mtx, uint16_t num)
 {
-	static int draw_count = 0;
-
-	if (draw_count < 50) {
-		const float* m = (const float*)mtx;
-		if (m) {
-			fprintf(stderr, "bgfx_shim: setTransform[%d] translate=(%.1f, %.1f, %.1f) scale=(%.3f, %.3f)\n",
-			        draw_count, m[12], m[13], m[14],
-			        m[0], m[5]);
-		}
-		draw_count++;
-	}
 	typedef uint32_t (*fn_t)(void*, const void*, uint16_t);
 	return ((fn_t)real_encoder_set_transform_fn)(encoder, mtx, num);
 }
@@ -624,27 +591,8 @@ void bgfx_shim_set_real_encoder_submit(void* func)
 void bgfx_encoder_submit_wrapper(void* encoder, uint16_t id, uint64_t program_and_depth,
                                   uint32_t extra1, uint8_t flags)
 {
-	static int log_count = 0;
-	if (log_count < 20) {
-		fprintf(stderr, "bgfx_shim: Encoder::submit(view=%u)\n", id);
-		log_count++;
-	}
 	typedef void (*fn_t)(void*, uint16_t, uint64_t, uint32_t, uint8_t);
 	((fn_t)real_encoder_submit_fn)(encoder, id, program_and_depth, extra1, flags);
 }
 
-void sdl_gl_get_drawable_size_wrapper(void* window, int* w, int* h)
-{
-	typedef void (*fn_t)(void*, int*, int*);
-	static fn_t real_fn = NULL;
-	if (!real_fn)
-		real_fn = (fn_t)dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
-	if (real_fn)
-		real_fn(window, w, h);
-	static int log_count = 0;
-	if (log_count < 30) {
-		fprintf(stderr, "bgfx_shim: SDL_GL_GetDrawableSize -> %dx%d\n",
-		        w ? *w : -1, h ? *h : -1);
-		log_count++;
-	}
-}
+

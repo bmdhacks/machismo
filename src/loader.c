@@ -107,17 +107,32 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 			p += seg->cmdsize;
 		}
 
-		slide = (uintptr_t) mmap((void*) base, mmapSize, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA, -1, 0);
+		/* Reserve the segment range plus extra space for branch island
+		 * pools (LSE emulation, trampolines).  The pool tail is kept
+		 * mapped so it is guaranteed adjacent to __TEXT. */
+		uintptr_t page_sz = sysconf(_SC_PAGESIZE);
+		size_t mmapAligned = (mmapSize + page_sz - 1) & ~(page_sz - 1);
+		size_t totalSize = mmapAligned + MACHISMO_POOL_PADDING;
+		slide = (uintptr_t) mmap((void*) base, totalSize, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA, -1, 0);
 		if (slide == (uintptr_t)MAP_FAILED)
 		{
 			fprintf(stderr, "Cannot mmap anonymous memory range: %s\n", strerror(errno));
 			exit(1);
 		}
 
-		munmap((void*)slide, mmapSize);
+		/* Unmap only the segment portion (page-aligned) — keep pool tail */
+		munmap((void*)slide, mmapAligned);
 
-		if (slide + mmapSize > lr->vm_addr_max)
-			lr->vm_addr_max = lr->base = slide + mmapSize;
+		/* Make the pool tail RWX for branch islands */
+		void* pool_base = (void*)(slide + mmapAligned);
+		mprotect(pool_base, MACHISMO_POOL_PADDING,
+		         PROT_READ | PROT_WRITE | PROT_EXEC);
+		lr->pool_base = pool_base;
+		lr->pool_size = MACHISMO_POOL_PADDING;
+		lr->pool_used = 0;
+
+		if (slide + totalSize > lr->vm_addr_max)
+			lr->vm_addr_max = lr->base = slide + totalSize;
 		slide -= base;
 
 		pie = true;

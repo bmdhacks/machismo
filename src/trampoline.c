@@ -46,63 +46,62 @@ struct trampoline_island {
 	uint64_t target_addr;  /* native function address */
 };
 
-/* Island pool — executable mmap near __TEXT */
+/* Island pool — executable memory near __TEXT */
 #define ISLAND_POOL_SIZE (1024 * 1024)  /* 1MB, enough for ~65K islands */
 static uint8_t* island_pool = NULL;
+static size_t island_pool_size = 0;
 static size_t island_pool_used = 0;
+
+void trampoline_set_pool(void* base, size_t size)
+{
+	island_pool = (uint8_t*)base;
+	island_pool_size = size;
+	island_pool_used = 0;
+	fprintf(stderr, "trampoline: island pool at %p (%zu KB)\n",
+	        base, size / 1024);
+}
 
 static int init_island_pool(uintptr_t text_base, size_t text_size)
 {
-	if (island_pool) return 0;  /* already initialized */
+	if (island_pool) return 0;  /* already set via trampoline_set_pool */
 
-	/* Allocate close to __TEXT for B instruction range (±128MB).
-	 * Try multiple locations: after __TEXT, before __TEXT, in 1MB steps. */
+	/* Fallback: try to mmap near __TEXT (works on kernels >= 4.17
+	 * that support MAP_FIXED_NOREPLACE; on older kernels the adjacent
+	 * pool from the loader should have been provided instead). */
 	uintptr_t page_size = sysconf(_SC_PAGESIZE);
+	size_t alloc_size = ISLAND_POOL_SIZE;
 	uintptr_t try_addrs[] = {
-		/* After __TEXT, aligned */
 		(text_base + text_size + page_size - 1) & ~(page_size - 1),
-		/* 64MB after __TEXT */
 		((text_base + text_size + 64*1024*1024) & ~(page_size - 1)),
-		/* Before __TEXT */
-		text_base >= ISLAND_POOL_SIZE + page_size ?
-			(text_base - ISLAND_POOL_SIZE) & ~(page_size - 1) : 0,
-		/* 64MB before __TEXT */
-		text_base >= 64*1024*1024 + ISLAND_POOL_SIZE ?
-			(text_base - 64*1024*1024) & ~(page_size - 1) : 0,
+		text_base >= alloc_size + page_size ?
+			(text_base - alloc_size) & ~(page_size - 1) : 0,
 	};
-
 	for (int i = 0; i < (int)(sizeof(try_addrs)/sizeof(try_addrs[0])); i++) {
 		if (try_addrs[i] == 0) continue;
-		island_pool = mmap((void*)try_addrs[i], ISLAND_POOL_SIZE,
+		island_pool = mmap((void*)try_addrs[i], alloc_size,
 		                   PROT_READ | PROT_WRITE | PROT_EXEC,
 		                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
 		                   -1, 0);
-		if (island_pool != MAP_FAILED) {
-			fprintf(stderr, "trampoline: island pool at %p (near __TEXT %p)\n",
-			        island_pool, (void*)text_base);
+		if (island_pool != MAP_FAILED && (uintptr_t)island_pool == try_addrs[i]) {
+			island_pool_size = alloc_size;
 			island_pool_used = 0;
+			fprintf(stderr, "trampoline: island pool at %p (fallback mmap)\n",
+			        island_pool);
 			return 0;
 		}
+		if (island_pool != MAP_FAILED) {
+			munmap(island_pool, alloc_size);
+			island_pool = NULL;
+		}
 	}
-
-	/* Last resort: let kernel choose (may be too far for B instruction) */
-	island_pool = mmap(NULL, ISLAND_POOL_SIZE,
-	                   PROT_READ | PROT_WRITE | PROT_EXEC,
-	                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (island_pool == MAP_FAILED) {
-		island_pool = NULL;
-		return -1;
-	}
-	fprintf(stderr, "trampoline: island pool at %p (kernel-chosen, may be far)\n",
-	        island_pool);
-	island_pool_used = 0;
-	return 0;
+	fprintf(stderr, "trampoline: failed to allocate island pool near __TEXT\n");
+	return -1;
 }
 
 /* Allocate an island and return its address, or 0 on failure */
 static uintptr_t alloc_island(uintptr_t native_addr)
 {
-	if (!island_pool || island_pool_used + ISLAND_SIZE > ISLAND_POOL_SIZE)
+	if (!island_pool || island_pool_used + ISLAND_SIZE > island_pool_size)
 		return 0;
 
 	struct trampoline_island* island =
@@ -122,7 +121,7 @@ static uintptr_t stub_island_addr = 0;
 static uintptr_t get_stub_island(void)
 {
 	if (stub_island_addr) return stub_island_addr;
-	if (!island_pool || island_pool_used + ISLAND_SIZE > ISLAND_POOL_SIZE)
+	if (!island_pool || island_pool_used + ISLAND_SIZE > island_pool_size)
 		return 0;
 
 	uint32_t* code = (uint32_t*)(island_pool + island_pool_used);
@@ -218,7 +217,7 @@ static uintptr_t abort_caller_addr = 0;
 static uintptr_t get_abort_caller(void)
 {
 	if (abort_caller_addr) return abort_caller_addr;
-	if (!island_pool || island_pool_used + ISLAND_SIZE > ISLAND_POOL_SIZE)
+	if (!island_pool || island_pool_used + ISLAND_SIZE > island_pool_size)
 		return 0;
 
 	struct trampoline_island* island =
@@ -243,7 +242,7 @@ static uintptr_t make_abort_island(const char* symbol_name)
 	uintptr_t caller = get_abort_caller();
 	if (!caller) return 0;
 
-	if (!island_pool || island_pool_used + ISLAND_SIZE > ISLAND_POOL_SIZE)
+	if (!island_pool || island_pool_used + ISLAND_SIZE > island_pool_size)
 		return 0;
 
 	uint32_t* code = (uint32_t*)(island_pool + island_pool_used);
@@ -496,7 +495,9 @@ int trampoline_patch_lib(void* mh, uintptr_t slide,
 			 * if Mach-O code tries to call it. */
 			uintptr_t abort_island = make_abort_island(name);
 			if (abort_island) {
-				fprintf(stderr, "trampoline: TRAPPED (no native match): %s\n", name);
+				extern int machismo_verbose;
+				if (machismo_verbose)
+					fprintf(stderr, "trampoline: TRAPPED (no native match): %s\n", name);
 				if (write_trampoline(func_addr, abort_island) == 0) {
 					trapped++;
 				}
@@ -729,8 +730,10 @@ void trampoline_guard_stale_data(void* mh, uintptr_t slide,
 		if (matches_prefix(name, prefixes, num_prefixes)) {
 			has_library[page_idx] = 1;
 			lib_data_syms++;
-			fprintf(stderr, "trampoline: stale data symbol: %s at %p\n",
-			        name, (void*)addr);
+			extern int machismo_verbose;
+			if (machismo_verbose)
+				fprintf(stderr, "trampoline: stale data symbol: %s at %p\n",
+				        name, (void*)addr);
 		} else {
 			has_other[page_idx] = 1;
 		}
