@@ -182,20 +182,26 @@ static const char* get_fake_home(void)
 	if (fake_home[0])
 		return fake_home;
 
-	/* Build path: <directory of game binary>/userdata */
-	char exe[4096];
-	ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-	if (len > 0) {
-		exe[len] = '\0';
-		/* Find last '/' to get directory */
-		char *slash = strrchr(exe, '/');
-		if (slash) {
-			*slash = '\0';
-			snprintf(fake_home, sizeof(fake_home), "%.4085s/userdata", exe);
+	/* MACHISMO_HOME overrides the default userdata location */
+	const char *override = getenv("MACHISMO_HOME");
+	if (override && override[0]) {
+		snprintf(fake_home, sizeof(fake_home), "%.4095s", override);
+	} else {
+		/* Build path: <directory of machismo binary>/userdata */
+		char exe[4096];
+		ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+		if (len > 0) {
+			exe[len] = '\0';
+			char *slash = strrchr(exe, '/');
+			if (slash) {
+				*slash = '\0';
+				snprintf(fake_home, sizeof(fake_home),
+					 "%.4085s/userdata", exe);
+			}
 		}
+		if (!fake_home[0])
+			snprintf(fake_home, sizeof(fake_home), "./userdata");
 	}
-	if (!fake_home[0])
-		snprintf(fake_home, sizeof(fake_home), "./userdata");
 
 	fprintf(stderr, "libsystem_shim: HOME rewritten to %s\n", fake_home);
 	return fake_home;
