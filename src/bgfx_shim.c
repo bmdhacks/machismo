@@ -250,7 +250,13 @@ bool bgfx_init_wrapper(const void* _init)
 	uint32_t* type_ptr = (uint32_t*)(init_copy + INIT_TYPE_OFFSET);
 	*type_ptr = forced_renderer_type;
 
-	/* Fix platform data — get real X11 window handle */
+	/* Detect KMSDRM from environment (same check as sdl_create_window_wrapper).
+	 * Used as fallback when SDL_GetWindowWMInfo returns subsystem=0. */
+	const char *video_drv = getenv("SDL_VIDEODRIVER");
+	int is_kmsdrm = (video_drv && strcmp(video_drv, "KMSDRM") == 0)
+	             || (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY"));
+
+	/* Fix platform data — get real window handle */
 	resolve_sdl_funcs();
 
 	if (sdl_GetWindowWMInfo && sdl_GetVersion) {
@@ -295,7 +301,10 @@ bool bgfx_init_wrapper(const void* _init)
 						fprintf(stderr, "bgfx_shim: Wayland (no egl wrapper) display=%p surface=%p\n",
 						        wl_display, wl_surface);
 					}
-				} else if (wminfo.subsystem == SDL_SYSWM_KMSDRM) {
+				} else if (wminfo.subsystem == SDL_SYSWM_KMSDRM
+			           || (wminfo.subsystem == 0 && is_kmsdrm)) {
+					if (wminfo.subsystem == 0)
+						fprintf(stderr, "bgfx_shim: subsystem=0 but KMSDRM env detected, using KMSDRM path\n");
 					/* KMSDRM: SDL keeps the GBM surface internal (not in WMInfo).
 					 * Create an SDL GL context so EGL is fully initialized,
 					 * then pass the current EGL display/context/surface to bgfx
