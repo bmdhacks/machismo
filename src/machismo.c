@@ -525,6 +525,10 @@ int main(int argc, char** argv, char** envp)
 		gdb_jit_register_macho((void*)machismo_load_results.mh,
 		                       machismo_load_results.slide);
 	}
+	for (int i = 0; i < g_num_macho_dylibs; i++) {
+		gdb_jit_register_macho((void*)g_macho_dylibs[i].mh,
+		                       g_macho_dylibs[i].slide);
+	}
 
 	/* Apply game-specific binary patches */
 	if (cfg.patches) {

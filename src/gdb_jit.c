@@ -195,10 +195,18 @@ struct macho_sym {
 	uint8_t  is_func;  /* 1 if text symbol */
 };
 
-/* Retained after gdb_jit_register_macho for runtime symbol lookup */
-static struct macho_sym *saved_syms = NULL;
-static char *saved_strtab = NULL;
-static int saved_nsyms = 0;
+/* Retained after gdb_jit_register_macho for runtime symbol lookup.
+ * Array supports multiple binaries (main exe + dylibs). */
+#define MAX_SYMTABS 9  /* 1 main exe + MAX_MACHO_DYLIBS (8) */
+
+struct symtab_entry {
+	struct macho_sym *syms;
+	char *strtab;
+	int nsyms;
+};
+
+static struct symtab_entry saved_symtabs[MAX_SYMTABS];
+static int num_saved_symtabs = 0;
 
 static int sym_addr_cmp(const void *a, const void *b)
 {
@@ -524,9 +532,17 @@ int gdb_jit_register_macho(void* mh, uintptr_t slide)
 
 	/* Keep syms + strtab for runtime symbol lookup (heap_trace, etc.)
 	 * w.buf is owned by entry (GDB JIT), shstrtab is no longer needed. */
-	saved_syms = syms;
-	saved_strtab = strtab.buf;
-	saved_nsyms = num_syms;
+	if (num_saved_symtabs < MAX_SYMTABS) {
+		saved_symtabs[num_saved_symtabs].syms = syms;
+		saved_symtabs[num_saved_symtabs].strtab = strtab.buf;
+		saved_symtabs[num_saved_symtabs].nsyms = num_syms;
+		num_saved_symtabs++;
+	} else {
+		fprintf(stderr, "gdb_jit: too many symbol tables (max %d), skipping runtime lookup\n",
+		        MAX_SYMTABS);
+		free(syms);
+		free(strtab.buf);
+	}
 	free(shstrtab.buf);
 
 	return num_syms;
@@ -536,46 +552,63 @@ int gdb_jit_register_macho(void* mh, uintptr_t slide)
 
 const char *gdb_jit_lookup_addr(uintptr_t addr)
 {
-	if (!saved_syms || saved_nsyms == 0)
-		return NULL;
+	const char *best_name = NULL;
+	uint64_t best_addr = 0;
 
-	/* Binary search for the largest sym.addr <= addr */
-	int lo = 0, hi = saved_nsyms - 1;
-	int best = -1;
-	while (lo <= hi) {
-		int mid = lo + (hi - lo) / 2;
-		if (saved_syms[mid].addr <= addr) {
-			best = mid;
-			lo = mid + 1;
-		} else {
-			hi = mid - 1;
+	for (int t = 0; t < num_saved_symtabs; t++) {
+		struct symtab_entry *st = &saved_symtabs[t];
+		if (!st->syms || st->nsyms == 0)
+			continue;
+
+		/* Binary search for the largest sym.addr <= addr */
+		int lo = 0, hi = st->nsyms - 1;
+		int idx = -1;
+		while (lo <= hi) {
+			int mid = lo + (hi - lo) / 2;
+			if (st->syms[mid].addr <= addr) {
+				idx = mid;
+				lo = mid + 1;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		if (idx < 0)
+			continue;
+
+		/* Check that addr is within a reasonable range of the symbol
+		 * (use next symbol's addr as upper bound, or 1MB max) */
+		uint64_t upper;
+		if (idx + 1 < st->nsyms)
+			upper = st->syms[idx + 1].addr;
+		else
+			upper = st->syms[idx].addr + (1 << 20);
+		if (addr >= upper)
+			continue;
+
+		/* Keep closest match (largest sym.addr that's still <= target) */
+		if (st->syms[idx].addr > best_addr) {
+			best_addr = st->syms[idx].addr;
+			best_name = st->strtab + st->syms[idx].strtab_offset;
 		}
 	}
-	if (best < 0)
-		return NULL;
-
-	/* Check that addr is within a reasonable range of the symbol
-	 * (use next symbol's addr as upper bound, or 1MB max) */
-	uint64_t upper;
-	if (best + 1 < saved_nsyms)
-		upper = saved_syms[best + 1].addr;
-	else
-		upper = saved_syms[best].addr + (1 << 20);
-	if (addr >= upper)
-		return NULL;
-
-	return saved_strtab + saved_syms[best].strtab_offset;
+	return best_name;
 }
 
 uintptr_t gdb_jit_lookup_name(const char *name)
 {
-	if (!saved_syms || saved_nsyms == 0 || !name)
+	if (!name)
 		return 0;
 
-	for (int i = 0; i < saved_nsyms; i++) {
-		const char *sym = saved_strtab + saved_syms[i].strtab_offset;
-		if (strcmp(sym, name) == 0)
-			return saved_syms[i].addr;
+	for (int t = 0; t < num_saved_symtabs; t++) {
+		struct symtab_entry *st = &saved_symtabs[t];
+		if (!st->syms || st->nsyms == 0)
+			continue;
+
+		for (int i = 0; i < st->nsyms; i++) {
+			const char *sym = st->strtab + st->syms[i].strtab_offset;
+			if (strcmp(sym, name) == 0)
+				return st->syms[i].addr;
+		}
 	}
 	return 0;
 }
