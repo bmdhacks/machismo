@@ -159,23 +159,24 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				int initprot = native_prot(seg->initprot);
 				int useprot = (initprot & PROT_EXEC) ? maxprot : initprot;
 
+				/* Skip __PAGEZERO — not part of the reservation, doesn't
+				 * need mapping (it's a 4GB null guard in the Mach-O). */
+				if (strcmp(seg->segname, "__PAGEZERO") == 0)
+				{
+					p += lc->cmdsize;
+					continue;
+				}
+
 				if (seg->filesize < seg->vmsize)
 				{
-					unsigned long addr = seg->vmaddr;
-
-					if (addr != 0)
-						addr += slide;
+					unsigned long addr = seg->vmaddr + slide;
 
 					/* MAP_FIXED is safe — PIE reservation guarantees this range is free */
 					rv = mmap((void*)addr, seg->vmsize, useprot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
 					if (rv == (void*)MAP_FAILED)
 					{
-						if (seg->vmaddr == 0 && useprot == 0) {
-							rv = 0;
-						} else {
-							fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-							exit(1);
-						}
+						fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
+						exit(1);
 					}
 				}
 
