@@ -124,8 +124,10 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 			exit(1);
 		}
 
-		/* Unmap only the segment portion (page-aligned) — keep pool tail */
-		munmap((void*)slide, mmapAligned);
+		/* Keep the entire reservation mapped — segment MAP_FIXED calls
+		 * below will replace the PROT_NONE pages in-place.  This avoids
+		 * a munmap/mmap race where another allocation could steal the
+		 * address space between the two calls. */
 
 		/* Make the pool tail RWX for branch islands */
 		void* pool_base = (void*)(slide + mmapAligned);
