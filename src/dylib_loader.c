@@ -160,18 +160,20 @@ struct macho_dylib_info *dylib_loader_load(const char *path)
 	}
 
 	uintptr_t vm_span = vm_high - vm_low;
+	size_t vm_aligned = PAGE_ROUNDUP(vm_span);
+	size_t total_size = vm_aligned + DYLIB_POOL_PADDING;
 
-	/* Reserve address space, then release (to get a base address) */
-	void *reservation = mmap(NULL, vm_span, PROT_NONE,
+	/* Reserve segments + pool tail, then unmap segments (keep pool) */
+	void *reservation = mmap(NULL, total_size, PROT_NONE,
 	                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	if (reservation == MAP_FAILED) {
 		fprintf(stderr, "dylib_loader: cannot reserve %lu bytes: %s\n",
-		        (unsigned long)vm_span, strerror(errno));
+		        (unsigned long)total_size, strerror(errno));
 		munmap(cmds_map, PAGE_ROUNDUP(cmds_total));
 		close(fd);
 		return NULL;
 	}
-	munmap(reservation, vm_span);
+	munmap(reservation, vm_aligned);
 	uintptr_t slide = (uintptr_t)reservation - vm_low;
 
 	/*
@@ -190,10 +192,11 @@ struct macho_dylib_info *dylib_loader_load(const char *path)
 			int initprot = native_prot(seg->initprot);
 			int useprot = (initprot & PROT_EXEC) ? maxprot : initprot;
 
-			/* Map anonymous for zero-fill portion */
+			/* Map anonymous for zero-fill portion.
+			 * MAP_FIXED is safe — we just reserved this range above. */
 			if (seg->vmsize > 0) {
 				void *rv = mmap((void *)addr, seg->vmsize, useprot,
-				                MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+				                MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
 				if (rv == MAP_FAILED) {
 					fprintf(stderr, "dylib_loader: cannot mmap segment %s at %p: %s\n",
 					        seg->segname, (void *)addr, strerror(errno));
@@ -235,6 +238,15 @@ struct macho_dylib_info *dylib_loader_load(const char *path)
 		close(fd);
 		return NULL;
 	}
+
+	/* Set up the pool tail for branch islands (LSE, trampolines).
+	 * The pool was reserved as part of the initial mmap and is
+	 * guaranteed adjacent to the segments. */
+	void *pool_base = (char *)reservation + vm_aligned;
+	mprotect(pool_base, DYLIB_POOL_PADDING, PROT_READ | PROT_WRITE | PROT_EXEC);
+	info->pool_base = pool_base;
+	info->pool_size = DYLIB_POOL_PADDING;
+	info->pool_used = 0;
 
 	/*
 	 * Pass 3: Find LC_SYMTAB and locate symbol/string tables via __LINKEDIT.

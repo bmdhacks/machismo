@@ -41,7 +41,6 @@
 #include "lse_emul.h"
 #include <sys/resource.h>
 #include <pthread.h>
-#include <sys/utsname.h>
 
 /* VM_PROT_* and SEG_DATA are defined in macho_defs.h */
 
@@ -58,8 +57,6 @@ static void setup_tlv_image(struct load_results* lr);
 static int native_prot(int prot);
 static void setup_space(struct load_results* lr, bool is_64_bit);
 static void start_thread(struct load_results* lr);
-static bool is_kernel_at_least(int major, int minor);
-static void* compatible_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 static void setup_stack64(const char* filepath, struct load_results* lr);
 
 /* UUID of the main executable */
@@ -69,9 +66,6 @@ __attribute__((used))
 struct load_results machismo_load_results = {0};
 
 void* __machismo_main_stack_top = NULL;
-
-static int kernel_major = -1;
-static int kernel_minor = -1;
 
 int machismo_verbose = 0;
 
@@ -324,90 +318,12 @@ int main(int argc, char** argv, char** envp)
 			uint32_t dp = 0;
 			int dfix = 0;
 
-			/* Find dylib text extent AND end of all segments.
-			 * __DATA/__LINKEDIT are mapped right after __TEXT, so the
-			 * island pool must go after ALL segments, not just __TEXT. */
-			uintptr_t dylib_text_end = 0;
-			uintptr_t dylib_vm_end = 0;
-			uintptr_t dylib_vm_start = (uintptr_t)-1;
-			for (uint32_t di = 0; di < dmh->ncmds && dp < dmh->sizeofcmds; di++) {
-				struct load_command *dlc = (struct load_command*)(dcmds + dp);
-				if (dlc->cmd == LC_SEGMENT_64) {
-					struct segment_command_64 *dseg = (struct segment_command_64*)dlc;
-					if (strcmp(dseg->segname, "__PAGEZERO") != 0) {
-						uintptr_t seg_start = dseg->vmaddr + mdi->slide;
-						uintptr_t seg_end = seg_start + dseg->vmsize;
-						if (seg_start < dylib_vm_start)
-							dylib_vm_start = seg_start;
-						if (seg_end > dylib_vm_end)
-							dylib_vm_end = seg_end;
-					}
-					if (dseg->maxprot & VM_PROT_EXECUTE) {
-						uintptr_t end = dseg->vmaddr + mdi->slide + dseg->vmsize;
-						if (end > dylib_text_end)
-							dylib_text_end = end;
-					}
-				}
-				dp += dlc->cmdsize;
-			}
-
-			/* Allocate per-dylib island pool near its text */
-			uint32_t *dylib_lse_pool = NULL;
-			uint32_t *dylib_lse_cur = NULL;
-			uint32_t *dylib_lse_end = NULL;
-			size_t dylib_pool_size = 64 * 1024;
-			uintptr_t dpg = sysconf(_SC_PAGESIZE);
-			if (dylib_text_end) {
-				/* Try after all segments, then with gaps, then before */
-				uintptr_t try_addrs[] = {
-					(dylib_vm_end + dpg - 1) & ~(dpg - 1),
-					(dylib_vm_end + 1*1024*1024) & ~(dpg - 1),
-					(dylib_vm_end + 4*1024*1024) & ~(dpg - 1),
-					(dylib_vm_end + 16*1024*1024) & ~(dpg - 1),
-					dylib_vm_start >= dylib_pool_size + dpg
-						? (dylib_vm_start - dylib_pool_size) & ~(dpg - 1) : 0,
-					dylib_vm_start >= dylib_pool_size + 4*1024*1024
-						? (dylib_vm_start - dylib_pool_size - 4*1024*1024) & ~(dpg - 1) : 0,
-				};
-				for (int ti = 0; ti < (int)(sizeof(try_addrs)/sizeof(try_addrs[0])); ti++) {
-					if (try_addrs[ti] == 0) continue;
-					dylib_lse_pool = (uint32_t*)mmap((void*)try_addrs[ti], dylib_pool_size,
-						PROT_READ | PROT_WRITE | PROT_EXEC,
-						MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-					if (dylib_lse_pool != MAP_FAILED) {
-						if ((uintptr_t)dylib_lse_pool != try_addrs[ti]) {
-							munmap(dylib_lse_pool, dylib_pool_size);
-							dylib_lse_pool = MAP_FAILED;
-							continue;
-						}
-						break;
-					}
-				}
-				/* Last resort: let kernel choose, verify ±128MB range */
-				if (!dylib_lse_pool || dylib_lse_pool == MAP_FAILED) {
-					dylib_lse_pool = (uint32_t*)mmap((void*)dylib_vm_end, dylib_pool_size,
-						PROT_READ | PROT_WRITE | PROT_EXEC,
-						MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-					if (dylib_lse_pool != MAP_FAILED) {
-						int64_t dist = (int64_t)((uintptr_t)dylib_lse_pool - dylib_text_end);
-						if (dist > 0x07FFFFFF || dist < -0x08000000) {
-							fprintf(stderr, "machismo: LSE pool for '%s' too far (dist=0x%lx), unmapping\n",
-							        mdi->path, (unsigned long)dist);
-							munmap(dylib_lse_pool, dylib_pool_size);
-							dylib_lse_pool = MAP_FAILED;
-						}
-					}
-				}
-				if (dylib_lse_pool != MAP_FAILED && dylib_lse_pool != NULL) {
-					dylib_lse_cur = dylib_lse_pool;
-					dylib_lse_end = dylib_lse_pool + dylib_pool_size / 4;
-				} else {
-					fprintf(stderr, "machismo: WARNING: LSE pool alloc failed for dylib '%s'"
-					        " (vm_end=%p) — LSE atomics will SIGILL\n",
-					        mdi->path, (void*)dylib_vm_end);
-					dylib_lse_pool = NULL;
-				}
-			}
+			/* Use the dylib's preallocated adjacent pool for LSE islands */
+			size_t dylib_pool_size = mdi->pool_size;
+			uint32_t *dylib_lse_pool = (uint32_t *)mdi->pool_base;
+			uint32_t *dylib_lse_cur = dylib_lse_pool;
+			uint32_t *dylib_lse_end = dylib_lse_pool
+				? dylib_lse_pool + dylib_pool_size / 4 : NULL;
 
 			dp = 0;
 			int dln = 0;
@@ -771,12 +687,10 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 		size = limit.rlim_cur;
 	}
 
-	if (compatible_mmap((void*)(lr->stack_top - size), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_GROWSDOWN, -1, 0) == MAP_FAILED) {
-		/* Try without MAP_FIXED_NOREPLACE */
-		if (compatible_mmap((void*)(lr->stack_top - size), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0) == MAP_FAILED) {
-			fprintf(stderr, "Failed to allocate stack of %lu bytes: %d (%s)\n", size, errno, strerror(errno));
-			exit(1);
-		}
+	if (mmap((void*)(lr->stack_top - size), size, PROT_READ | PROT_WRITE,
+	         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0) == MAP_FAILED) {
+		fprintf(stderr, "Failed to allocate stack of %lu bytes: %d (%s)\n", size, errno, strerror(errno));
+		exit(1);
 	}
 
 	lr->kernfd = -1;
@@ -1032,49 +946,3 @@ static void start_thread(struct load_results* lr) {
 #endif
 }
 
-static bool is_kernel_at_least(int major, int minor) {
-	if (kernel_major == -1) {
-		struct utsname uname_info;
-		if (uname(&uname_info) == -1) {
-			return false;
-		}
-		kernel_major = 0;
-		kernel_minor = 0;
-		size_t pos = 0;
-		while (uname_info.release[pos] != '\0' && uname_info.release[pos] != '.') {
-			kernel_major = kernel_major * 10 + uname_info.release[pos] - '0';
-			++pos;
-		}
-		++pos;
-		while (uname_info.release[pos] != '\0' && uname_info.release[pos] != '.') {
-			kernel_minor = kernel_minor * 10 + uname_info.release[pos] - '0';
-			++pos;
-		}
-	}
-
-	if (major != kernel_major) {
-		return kernel_major > major;
-	}
-
-	return kernel_minor >= minor;
-}
-
-void* compatible_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-	if ((flags & MAP_FIXED_NOREPLACE) && !is_kernel_at_least(4, 17)) {
-		/* Kernel lacks MAP_FIXED_NOREPLACE (added 4.17).
-		 * For non-NULL addr: use MAP_FIXED — the PIE probe already verified
-		 * this range is available, so clobbering is safe.
-		 * For NULL addr (e.g. __PAGEZERO): just fail — we can't force addr 0
-		 * and a hint-based mmap won't return it. */
-		flags &= ~MAP_FIXED_NOREPLACE;
-		if (addr != NULL)
-			flags |= MAP_FIXED;
-		/* else: non-fixed, will likely return a different address and caller
-		 * handles the failure (vmaddr==0 && prot==0 → skip). */
-	}
-	void* result = mmap(addr, length, prot, flags, fd, offset);
-	if ((result == (void*)MAP_FAILED) && (flags & MAP_GROWSDOWN) && (errno == EOPNOTSUPP)) {
-		result = mmap(addr, length, prot, (flags & ~MAP_GROWSDOWN), fd, offset);
-	}
-	return result;
-}

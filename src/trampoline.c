@@ -63,38 +63,11 @@ void trampoline_set_pool(void* base, size_t size)
 
 static int init_island_pool(uintptr_t text_base, size_t text_size)
 {
-	if (island_pool) return 0;  /* already set via trampoline_set_pool */
-
-	/* Fallback: try to mmap near __TEXT (works on kernels >= 4.17
-	 * that support MAP_FIXED_NOREPLACE; on older kernels the adjacent
-	 * pool from the loader should have been provided instead). */
-	uintptr_t page_size = sysconf(_SC_PAGESIZE);
-	size_t alloc_size = ISLAND_POOL_SIZE;
-	uintptr_t try_addrs[] = {
-		(text_base + text_size + page_size - 1) & ~(page_size - 1),
-		((text_base + text_size + 64*1024*1024) & ~(page_size - 1)),
-		text_base >= alloc_size + page_size ?
-			(text_base - alloc_size) & ~(page_size - 1) : 0,
-	};
-	for (int i = 0; i < (int)(sizeof(try_addrs)/sizeof(try_addrs[0])); i++) {
-		if (try_addrs[i] == 0) continue;
-		island_pool = mmap((void*)try_addrs[i], alloc_size,
-		                   PROT_READ | PROT_WRITE | PROT_EXEC,
-		                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-		                   -1, 0);
-		if (island_pool != MAP_FAILED && (uintptr_t)island_pool == try_addrs[i]) {
-			island_pool_size = alloc_size;
-			island_pool_used = 0;
-			fprintf(stderr, "trampoline: island pool at %p (fallback mmap)\n",
-			        island_pool);
-			return 0;
-		}
-		if (island_pool != MAP_FAILED) {
-			munmap(island_pool, alloc_size);
-			island_pool = NULL;
-		}
-	}
-	fprintf(stderr, "trampoline: failed to allocate island pool near __TEXT\n");
+	(void)text_base; (void)text_size;
+	/* Pool must be set up by caller via trampoline_set_pool() before
+	 * trampoline_apply(). The loader preallocates it adjacent to __TEXT. */
+	if (island_pool) return 0;
+	fprintf(stderr, "trampoline: no island pool — call trampoline_set_pool() first\n");
 	return -1;
 }
 

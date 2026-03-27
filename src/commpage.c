@@ -72,25 +72,15 @@ void commpage_setup(bool _64bit)
 	commpage = (uint8_t*) mmap((void*)ARM64_COMMPAGE_BASE,
 			ARM64_COMMPAGE_LENGTH,
 			PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
 			-1, 0);
 
 	if (commpage == MAP_FAILED)
 	{
-		/* Try without MAP_FIXED_NOREPLACE for older kernels */
-		commpage = (uint8_t*) mmap((void*)ARM64_COMMPAGE_BASE,
-				ARM64_COMMPAGE_LENGTH,
-				PROT_READ | PROT_WRITE,
-				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-				-1, 0);
-
-		if (commpage == MAP_FAILED)
-		{
-			fprintf(stderr, "Cannot mmap commpage at %p: %s\n",
-					(void*)ARM64_COMMPAGE_BASE, strerror(errno));
-			fprintf(stderr, "Continuing without commpage (some features may not work)\n");
-			return;
-		}
+		fprintf(stderr, "Cannot mmap commpage at %p: %s\n",
+				(void*)ARM64_COMMPAGE_BASE, strerror(errno));
+		fprintf(stderr, "Continuing without commpage (some features may not work)\n");
+		return;
 	}
 
 	memset(commpage, 0, ARM64_COMMPAGE_LENGTH);
