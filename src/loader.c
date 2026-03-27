@@ -159,7 +159,7 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				{
 					unsigned long map_addr;
 					(void)map_addr;
-					if (slide != 0)
+					if (pie)
 					{
 						unsigned long addr = seg->vmaddr;
 
@@ -179,9 +179,10 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 					}
 					else
 					{
+						/* Non-PIE: no prior reservation, use NOREPLACE for safety */
 						size_t size = seg->vmsize - seg->filesize;
 						rv = mmap((void*) PAGE_ALIGN(seg->vmaddr + seg->vmsize - size), PAGE_ROUNDUP(size), useprot,
-								MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+								MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 						if (rv == (void*)MAP_FAILED)
 						{
 							if (seg->vmaddr == 0 && useprot == 0) {
@@ -197,12 +198,8 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				if (seg->filesize > 0)
 				{
 					unsigned long addr = seg->vmaddr + slide;
-					int flag = MAP_FIXED;
-					if (seg->filesize < seg->vmsize) {
-						flag = MAP_FIXED;
-					}
 					rv = mmap((void*)addr, seg->filesize, useprot,
-							flag | MAP_PRIVATE, fd, seg->fileoff + fat_offset);
+							MAP_FIXED | MAP_PRIVATE, fd, seg->fileoff + fat_offset);
 					if (rv == (void*)MAP_FAILED)
 					{
 						if (seg->vmaddr == 0 && useprot == 0) {
