@@ -136,7 +136,10 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 		pie = true;
 	}
-	(void)pie;
+	if (!pie) {
+		fprintf(stderr, "machismo: non-PIE binaries are not supported\n");
+		exit(1);
+	}
 
 	for (uint32_t i = 0, p = 0; i < header.ncmds && p < header.sizeofcmds; i++)
 	{
@@ -157,40 +160,20 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 				if (seg->filesize < seg->vmsize)
 				{
-					unsigned long map_addr;
-					(void)map_addr;
-					if (pie)
-					{
-						unsigned long addr = seg->vmaddr;
+					unsigned long addr = seg->vmaddr;
 
-						if (addr != 0)
-							addr += slide;
+					if (addr != 0)
+						addr += slide;
 
-						rv = mmap((void*)addr, seg->vmsize, useprot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
-						if (rv == (void*)MAP_FAILED)
-						{
-							if (seg->vmaddr == 0 && useprot == 0) {
-								rv = 0;
-							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-								exit(1);
-							}
-						}
-					}
-					else
+					/* MAP_FIXED is safe — PIE reservation guarantees this range is free */
+					rv = mmap((void*)addr, seg->vmsize, useprot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+					if (rv == (void*)MAP_FAILED)
 					{
-						/* Non-PIE: no prior reservation, use NOREPLACE for safety */
-						size_t size = seg->vmsize - seg->filesize;
-						rv = mmap((void*) PAGE_ALIGN(seg->vmaddr + seg->vmsize - size), PAGE_ROUNDUP(size), useprot,
-								MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
-						if (rv == (void*)MAP_FAILED)
-						{
-							if (seg->vmaddr == 0 && useprot == 0) {
-								rv = 0;
-							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-								exit(1);
-							}
+						if (seg->vmaddr == 0 && useprot == 0) {
+							rv = 0;
+						} else {
+							fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
+							exit(1);
 						}
 					}
 				}
