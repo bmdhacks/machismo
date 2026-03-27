@@ -53,7 +53,6 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 	struct MACH_HEADER_STRUCT* mappedHeader = NULL;
 	uintptr_t slide = 0;
 	uintptr_t mmapSize = 0;
-	bool pie = false;
 	uint32_t fat_offset;
 	void* tmp_map_base = NULL;
 
@@ -86,7 +85,13 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 	cmds = (void*)((char*)tmp_map_base + sizeof(header));
 
-	if ((header.filetype == MH_EXECUTE && header.flags & MH_PIE) || header.filetype == MH_DYLINKER)
+	/* All macOS arm64 binaries are PIE — Apple has required it since
+	 * OS X 10.7, and ARM Macs (M1+) only exist on macOS 11+. */
+	if (!(header.flags & MH_PIE) && header.filetype != MH_DYLINKER) {
+		fprintf(stderr, "machismo: non-PIE binaries are not supported\n");
+		exit(1);
+	}
+
 	{
 		uintptr_t base = -1;
 
@@ -133,12 +138,6 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 		if (slide + totalSize > lr->vm_addr_max)
 			lr->vm_addr_max = lr->base = slide + totalSize;
 		slide -= base;
-
-		pie = true;
-	}
-	if (!pie) {
-		fprintf(stderr, "machismo: non-PIE binaries are not supported\n");
-		exit(1);
 	}
 
 	for (uint32_t i = 0, p = 0; i < header.ncmds && p < header.sizeofcmds; i++)
