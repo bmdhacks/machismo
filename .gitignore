@@ -31,3 +31,12 @@ tests/test_bgfx_gles
 # Runtime
 userdata/
 test_lse_emul
+test_necrolevel_rng
+
+# CMake compiler detection artifacts
+cinctest.c
+clang_major.c
+clang_major.cpp
+clang_c_major
+clang_cpp_major
+src/include/

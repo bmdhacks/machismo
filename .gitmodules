@@ -1,6 +1,7 @@
 [submodule "extern/bgfx"]
 	path = extern/bgfx
 	url = https://github.com/bkaradzic/bgfx.git
+	ignore = dirty
 [submodule "extern/bimg"]
 	path = extern/bimg
 	url = https://github.com/bkaradzic/bimg.git
@@ -13,6 +14,7 @@
 [submodule "extern/llvm-project"]
 	path = extern/llvm-project
 	url = https://github.com/llvm/llvm-project.git
+	ignore = dirty
 [submodule "extern/LuaJIT"]
 	path = extern/LuaJIT
 	url = https://github.com/LuaJIT/LuaJIT.git
