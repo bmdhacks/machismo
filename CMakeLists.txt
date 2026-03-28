@@ -69,6 +69,12 @@ if(BUILD_TESTS)
     target_compile_options(test_lse_emul PRIVATE -Wall -O2 -g)
     target_compile_definitions(test_lse_emul PRIVATE _GNU_SOURCE)
     target_link_libraries(test_lse_emul PRIVATE pthread)
+
+    add_executable(test_necrolevel_rng tests/test_necrolevel_rng.c src/dylib_loader.c)
+    target_include_directories(test_necrolevel_rng PRIVATE src)
+    target_compile_options(test_necrolevel_rng PRIVATE -Wall -O2 -g)
+    target_compile_definitions(test_necrolevel_rng PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_necrolevel_rng PRIVATE dl m)
 endif()
 
 # --- libgame_patches.so (NecroDancer-specific function replacements) ---

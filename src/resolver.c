@@ -544,6 +544,133 @@ static uintptr_t wrap_ctor_for_apple_abi(uintptr_t real_addr)
 	return (uintptr_t)t;
 }
 
+/* ---- Apple ARM64 variadic calling convention adapter ----
+ *
+ * On macOS ARM64, ALL variadic arguments are passed on the stack.
+ * On Linux AAPCS64, variadic arguments go in registers (x0-x7) first.
+ *
+ * The fix: wrap each variadic function with a thunk that builds a Linux
+ * va_list struct pointing at the macOS stack args, then calls the v*
+ * counterpart (sprintf → vsprintf, printf → vprintf, etc.).
+ *
+ * The Linux va_list has a __stack pointer and offset fields. When
+ * __gr_offs = 0 and __vr_offs = 0, va_arg always reads from __stack.
+ * Since macOS and Linux use the same 8-byte-aligned stack layout for
+ * spilled args, we just point __stack at the macOS data.
+ *
+ * This handles unlimited args and mixed int/float types correctly.
+ */
+
+struct variadic_thunk {
+	uint32_t stp;           /* +0:  stp x29, x30, [sp, #-48]! */
+	uint32_t mov_fp;        /* +4:  mov x29, sp */
+	uint32_t load_source;   /* +8:  add x8, x29, #48 (stack) OR mov x8, x{N} (va_list) */
+	uint32_t str_stack;     /* +12: str x8, [sp, #16]    — va_list.__stack */
+	uint32_t str_gr_top;    /* +16: str xzr, [sp, #24]   — va_list.__gr_top = NULL */
+	uint32_t str_vr_top;    /* +20: str xzr, [sp, #32]   — va_list.__vr_top = NULL */
+	uint32_t stp_offs;      /* +24: stp wzr, wzr, [sp, #40] — __gr_offs=0, __vr_offs=0 */
+	uint32_t set_va_ptr;    /* +28: add x{D}, sp, #16    — &linux_va_list */
+	uint32_t ldr_target;    /* +32: ldr x16, [pc, #16]   — load from +48 */
+	uint32_t blr_target;    /* +36: blr x16 */
+	uint32_t ldp_restore;   /* +40: ldp x29, x30, [sp], #48 */
+	uint32_t ret_instr;     /* +44: ret */
+	uint64_t target_addr;   /* +48: v* function address (8-byte aligned) */
+};
+
+struct variadic_info {
+	const char *name;       /* import symbol (without leading underscore) */
+	const char *v_name;     /* v* counterpart to dlsym */
+	int dest_reg;           /* register that receives &linux_va_list */
+	int is_va_list;         /* 1 = source is a register (va_list passthrough) */
+	int source_reg;         /* for va_list: which register holds macOS va_list */
+};
+
+static const struct variadic_info variadic_functions[] = {
+	/* True variadic → v* counterpart.
+	 * dest_reg = number of fixed args = where va_list ptr goes in v* call */
+	{"printf",          "vprintf",          1, 0, 0},
+	{"fprintf",         "vfprintf",         2, 0, 0},
+	{"sprintf",         "vsprintf",         2, 0, 0},
+	{"snprintf",        "vsnprintf",        3, 0, 0},
+	{"sscanf",          "vsscanf",          2, 0, 0},
+	{"__sprintf_chk",   "__vsprintf_chk",   4, 0, 0},
+	/* va_list passthrough — same glibc function, converted va_list.
+	 * source_reg = register holding macOS va_list (char*) */
+	{"vsnprintf",       "vsnprintf",        3, 1, 3},
+	{"vsscanf",         "vsscanf",          2, 1, 2},
+	{"__vsnprintf_chk", "__vsnprintf_chk",  5, 1, 5},
+	{NULL, NULL, 0, 0, 0}
+};
+
+static const struct variadic_info* lookup_variadic(const char* name)
+{
+	for (int i = 0; variadic_functions[i].name; i++) {
+		if (strcmp(name, variadic_functions[i].name) == 0)
+			return &variadic_functions[i];
+	}
+	return NULL;
+}
+
+static uint8_t* variadic_pool = NULL;
+static size_t variadic_pool_used = 0;
+static size_t variadic_pool_capacity = 0;
+static int variadic_thunk_count = 0;
+
+static uintptr_t create_variadic_thunk(uintptr_t v_func_addr,
+                                       const struct variadic_info* vi)
+{
+	if (!variadic_pool) {
+		long page_size = sysconf(_SC_PAGESIZE);
+		variadic_pool_capacity = page_size * 2; /* 2 pages, room for ~120 thunks */
+		variadic_pool = mmap(NULL, variadic_pool_capacity,
+		                     PROT_READ | PROT_WRITE | PROT_EXEC,
+		                     MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (variadic_pool == MAP_FAILED) {
+			fprintf(stderr, "resolver: failed to allocate variadic thunk pool\n");
+			variadic_pool = NULL;
+			return 0;
+		}
+	}
+
+	if (variadic_pool_used + sizeof(struct variadic_thunk) > variadic_pool_capacity) {
+		fprintf(stderr, "resolver: variadic thunk pool exhausted\n");
+		return 0;
+	}
+
+	struct variadic_thunk* t =
+		(struct variadic_thunk*)(variadic_pool + variadic_pool_used);
+	variadic_pool_used += sizeof(struct variadic_thunk);
+
+	t->stp         = 0xA9BD7BFD; /* stp x29, x30, [sp, #-48]! */
+	t->mov_fp      = 0x910003FD; /* mov x29, sp */
+
+	if (vi->is_va_list)
+		/* mov x8, x{source_reg} — grab macOS va_list from register */
+		t->load_source = 0xAA0003E8 | ((uint32_t)vi->source_reg << 16);
+	else
+		/* add x8, x29, #48 — compute caller's sp (macOS variadic args) */
+		t->load_source = 0x9100C3A8;
+
+	t->str_stack   = 0xF9000BE8; /* str x8, [sp, #16]    — __stack */
+	t->str_gr_top  = 0xF9000FFF; /* str xzr, [sp, #24]   — __gr_top = NULL */
+	t->str_vr_top  = 0xF90013FF; /* str xzr, [sp, #32]   — __vr_top = NULL */
+	t->stp_offs    = 0x29057FFF; /* stp wzr, wzr, [sp, #40] — __gr_offs=0, __vr_offs=0 */
+
+	/* add x{dest_reg}, sp, #16 */
+	t->set_va_ptr  = 0x910043E0 | (uint32_t)vi->dest_reg;
+
+	t->ldr_target  = 0x58000090; /* ldr x16, [pc, #16]   — load from +48 */
+	t->blr_target  = 0xD63F0200; /* blr x16 */
+	t->ldp_restore = 0xA8C37BFD; /* ldp x29, x30, [sp], #48 */
+	t->ret_instr   = 0xD65F03C0; /* ret */
+	t->target_addr = v_func_addr;
+
+	__builtin___clear_cache((char*)t, (char*)(t + 1));
+	variadic_thunk_count++;
+
+	return (uintptr_t)t;
+}
+
 /* ---- Mach-O symbol table lookup ----
  *
  * Resolves symbols defined in the Mach-O binary itself.
@@ -669,8 +796,8 @@ int resolver_resolve_fixups(void* mh, uintptr_t slide, const char* map_file)
 		goto out;
 	}
 
-	fprintf(stderr, "resolver: done — %d binds resolved, %d stubbed, %d failed, %d rebases, %d ctor/dtor ABI adapters\n",
-			rs.binds_resolved, rs.binds_stubbed, rs.binds_failed, rs.rebases_applied, ctor_tramp_count);
+	fprintf(stderr, "resolver: done — %d binds resolved, %d stubbed, %d failed, %d rebases, %d ctor/dtor ABI adapters, %d variadic thunks\n",
+			rs.binds_resolved, rs.binds_stubbed, rs.binds_failed, rs.rebases_applied, ctor_tramp_count, variadic_thunk_count);
 
 	ret = 0;
 
@@ -1097,6 +1224,14 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 			uintptr_t result = (uintptr_t)addr + addend;
 			if (is_ctor_or_dtor(sym_name) && !ctor_has_stack_params(sym_name))
 				result = wrap_ctor_for_apple_abi(result);
+			const struct variadic_info* vi = lookup_variadic(lookup_name);
+			if (vi) {
+				void* v_func = dlsym(RTLD_DEFAULT, vi->v_name);
+				if (v_func) {
+					uintptr_t thunk = create_variadic_thunk((uintptr_t)v_func, vi);
+					if (thunk) result = thunk;
+				}
+			}
 			rs->binds_resolved++;
 			return result;
 		}
@@ -1115,6 +1250,14 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 			uintptr_t result = (uintptr_t)addr + addend;
 			if (is_ctor_or_dtor(sym_name) && !ctor_has_stack_params(sym_name))
 				result = wrap_ctor_for_apple_abi(result);
+			const struct variadic_info* vi = lookup_variadic(lookup_name);
+			if (vi) {
+				void* v_func = dlsym(RTLD_DEFAULT, vi->v_name);
+				if (v_func) {
+					uintptr_t thunk = create_variadic_thunk((uintptr_t)v_func, vi);
+					if (thunk) result = thunk;
+				}
+			}
 			rs->binds_resolved++;
 			if (result == 0)
 				fprintf(stderr, "resolver: WARNING: weak sym '%s' resolved to %p + addend %ld = 0!\n",
@@ -1178,6 +1321,14 @@ static uintptr_t resolve_import(struct resolver_state* rs,
 					if (machismo_verbose)
 						fprintf(stderr, "resolver: ctor/dtor ABI wrap: %s\n", sym_name);
 					result = wrap_ctor_for_apple_abi(result);
+				}
+			}
+			const struct variadic_info* vi = lookup_variadic(lookup_name);
+			if (vi) {
+				void* v_func = dlsym(RTLD_DEFAULT, vi->v_name);
+				if (v_func) {
+					uintptr_t thunk = create_variadic_thunk((uintptr_t)v_func, vi);
+					if (thunk) result = thunk;
 				}
 			}
 			rs->binds_resolved++;
