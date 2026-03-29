@@ -943,6 +943,76 @@ void _Unwind_Resume(void* exception_object)
 		real_unwind_resume(exception_object);
 }
 
+/* ===== open() / openat() ABI translation ===== */
+
+/*
+ * macOS and Linux have entirely different values for fcntl.h O_* flags.
+ * If we don't translate these, file creation silently fails because
+ * the Linux kernel interprets macOS O_CREAT as O_TRUNC!
+ */
+#define DARWIN_O_RDONLY   0x0000
+#define DARWIN_O_WRONLY   0x0001
+#define DARWIN_O_RDWR     0x0002
+#define DARWIN_O_APPEND   0x0008
+#define DARWIN_O_CREAT    0x0200
+#define DARWIN_O_TRUNC    0x0400
+#define DARWIN_O_EXCL     0x0800
+
+/* macOS AT_FDCWD is -2, Linux is -100 */
+#define DARWIN_AT_FDCWD   -2
+
+static int translate_oflags(int darwin_flags) {
+	/* Base access modes (O_RDONLY, O_WRONLY, O_RDWR) are identical (0, 1, 2) */
+	int linux_flags = darwin_flags & 3; 
+
+	if (darwin_flags & DARWIN_O_APPEND) linux_flags |= O_APPEND;
+	if (darwin_flags & DARWIN_O_CREAT)  linux_flags |= O_CREAT;
+	if (darwin_flags & DARWIN_O_TRUNC)  linux_flags |= O_TRUNC;
+	if (darwin_flags & DARWIN_O_EXCL)   linux_flags |= O_EXCL;
+	
+	return linux_flags;
+}
+
+/* Intercept the Mach-O binary's call to open */
+int shim_open(const char *pathname, int flags, ...) __asm__("open");
+int shim_open(const char *pathname, int flags, ...)
+{
+	int linux_flags = translate_oflags(flags);
+	mode_t mode = 0;
+
+	/* Only extract mode if O_CREAT was requested */
+	if (flags & DARWIN_O_CREAT) {
+		va_list args;
+		va_start(args, flags);
+		mode = va_arg(args, mode_t);
+		va_end(args);
+	}
+
+	/* aarch64 Linux doesn't have SYS_open, everything goes through SYS_openat */
+	return syscall(SYS_openat, AT_FDCWD, pathname, linux_flags, mode);
+}
+
+/* Intercept the Mach-O binary's call to openat */
+int shim_openat(int dirfd, const char *pathname, int flags, ...) __asm__("openat");
+int shim_openat(int dirfd, const char *pathname, int flags, ...)
+{
+	if (dirfd == DARWIN_AT_FDCWD) {
+		dirfd = AT_FDCWD; /* Translate -2 to -100 */
+	}
+
+	int linux_flags = translate_oflags(flags);
+	mode_t mode = 0;
+
+	if (flags & DARWIN_O_CREAT) {
+		va_list args;
+		va_start(args, flags);
+		mode = va_arg(args, mode_t);
+		va_end(args);
+	}
+
+	return syscall(SYS_openat, dirfd, pathname, linux_flags, mode);
+}
+
 /* ===== stat() ABI translation ===== */
 
 /*
