@@ -1,10 +1,11 @@
 /*
  * libSystem.B.dylib shim for aarch64 Linux.
  *
- * Maps Apple libSystem symbols to glibc equivalents. Standard C/POSIX
- * symbols (malloc, pthread_create, open, strlen, etc.) resolve through
- * normal glibc linking — this file only implements Apple-specific symbols
- * that don't exist on Linux.
+ * Maps Apple libSystem symbols to glibc equivalents. Also translates
+ * POSIX functions whose constants differ between Darwin and Linux
+ * (O_* flags, AT_* flags, fcntl commands, struct stat layout, etc.).
+ * Remaining standard C/POSIX symbols (malloc, pthread_create, strlen,
+ * etc.) resolve through normal glibc linking.
  *
  * Built as a shared library:
  *   gcc -shared -fPIC -o libsystem_shim.so libsystem_shim.c -lm -lpthread -ldl
@@ -29,6 +30,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <stdarg.h>
 
 /* ===== Mach time ===== */
 
@@ -943,44 +945,142 @@ void _Unwind_Resume(void* exception_object)
 		real_unwind_resume(exception_object);
 }
 
-/* ===== open() / openat() ABI translation ===== */
+/* ===== File operation ABI translation ===== */
 
 /*
- * macOS and Linux have entirely different values for fcntl.h O_* flags.
- * If we don't translate these, file creation silently fails because
- * the Linux kernel interprets macOS O_CREAT as O_TRUNC!
+ * macOS and Linux assign entirely different bit values to O_* flags,
+ * AT_* flags, and some fcntl() command numbers. Without translation:
+ *   - Darwin O_CREAT (0x0200) becomes Linux O_TRUNC — corrupting files
+ *   - Darwin O_NONBLOCK (0x0004) is meaningless on Linux (unused bit)
+ *   - Darwin AT_FDCWD (-2) != Linux AT_FDCWD (-100)
+ *   - Darwin AT_SYMLINK_NOFOLLOW (0x0020) != Linux (0x0100)
+ *
+ * We translate at every entry point where Mach-O code passes these values.
  */
-#define DARWIN_O_RDONLY   0x0000
-#define DARWIN_O_WRONLY   0x0001
-#define DARWIN_O_RDWR     0x0002
-#define DARWIN_O_APPEND   0x0008
-#define DARWIN_O_CREAT    0x0200
-#define DARWIN_O_TRUNC    0x0400
-#define DARWIN_O_EXCL     0x0800
 
-/* macOS AT_FDCWD is -2, Linux is -100 */
-#define DARWIN_AT_FDCWD   -2
+/* ---- Darwin O_* flag values (XNU bsd/sys/fcntl.h) ---- */
+#define DARWIN_O_NONBLOCK    0x00000004
+#define DARWIN_O_APPEND      0x00000008
+#define DARWIN_O_SHLOCK      0x00000010  /* no Linux equivalent */
+#define DARWIN_O_EXLOCK      0x00000020  /* no Linux equivalent */
+#define DARWIN_O_ASYNC       0x00000040
+#define DARWIN_O_NOFOLLOW    0x00000100
+#define DARWIN_O_CREAT       0x00000200
+#define DARWIN_O_TRUNC       0x00000400
+#define DARWIN_O_EXCL        0x00000800
+#define DARWIN_O_EVTONLY     0x00008000  /* no Linux equivalent */
+#define DARWIN_O_NOCTTY      0x00020000
+#define DARWIN_O_DIRECTORY   0x00100000
+#define DARWIN_O_SYMLINK     0x00200000  /* no Linux equivalent */
+#define DARWIN_O_DSYNC       0x00400000
+#define DARWIN_O_CLOEXEC     0x01000000
 
-static int translate_oflags(int darwin_flags) {
-	/* Base access modes (O_RDONLY, O_WRONLY, O_RDWR) are identical (0, 1, 2) */
-	int linux_flags = darwin_flags & 3; 
+/* ---- Darwin AT_* flag values (XNU bsd/sys/fcntl.h) ---- */
+#define DARWIN_AT_FDCWD              (-2)
+#define DARWIN_AT_EACCESS            0x0010
+#define DARWIN_AT_SYMLINK_NOFOLLOW   0x0020
+#define DARWIN_AT_SYMLINK_FOLLOW     0x0040
+#define DARWIN_AT_REMOVEDIR          0x0080
 
-	if (darwin_flags & DARWIN_O_APPEND) linux_flags |= O_APPEND;
-	if (darwin_flags & DARWIN_O_CREAT)  linux_flags |= O_CREAT;
-	if (darwin_flags & DARWIN_O_TRUNC)  linux_flags |= O_TRUNC;
-	if (darwin_flags & DARWIN_O_EXCL)   linux_flags |= O_EXCL;
-	
+/* ---- Darwin fcntl commands that differ from Linux ----
+ * F_DUPFD(0), F_GETFD(1), F_SETFD(2), F_GETFL(3), F_SETFL(4) are the
+ * same on both platforms. The rest are renumbered or macOS-only. */
+#define DARWIN_F_GETOWN     5   /* Linux: 9 */
+#define DARWIN_F_SETOWN     6   /* Linux: 8 */
+#define DARWIN_F_GETLK      7   /* Linux: 5 */
+#define DARWIN_F_SETLK      8   /* Linux: 6 */
+#define DARWIN_F_SETLKW     9   /* Linux: 7 */
+#define DARWIN_F_RDADVISE   44  /* no Linux equivalent */
+#define DARWIN_F_RDAHEAD    45  /* no Linux equivalent */
+#define DARWIN_F_NOCACHE    48  /* no Linux equivalent */
+#define DARWIN_F_GETPATH    50  /* implement via /proc */
+#define DARWIN_F_FULLFSYNC  51  /* implement via fsync */
+
+/* ---- Translation helpers ---- */
+
+struct flag_pair { int darwin; int linux_val; };
+
+static const struct flag_pair oflags_map[] = {
+	{ DARWIN_O_NONBLOCK,  O_NONBLOCK  },
+	{ DARWIN_O_APPEND,    O_APPEND    },
+	{ DARWIN_O_ASYNC,     FASYNC      },
+	{ DARWIN_O_NOFOLLOW,  O_NOFOLLOW  },
+	{ DARWIN_O_CREAT,     O_CREAT     },
+	{ DARWIN_O_TRUNC,     O_TRUNC     },
+	{ DARWIN_O_EXCL,      O_EXCL      },
+	{ DARWIN_O_NOCTTY,    O_NOCTTY    },
+	{ DARWIN_O_DIRECTORY, O_DIRECTORY },
+	{ DARWIN_O_DSYNC,     O_DSYNC     },
+	{ DARWIN_O_CLOEXEC,   O_CLOEXEC   },
+	{ 0, 0 }
+};
+
+/* Darwin O_flags → Linux O_flags */
+static int translate_oflags(int darwin_flags)
+{
+	/* Access mode bits (O_RDONLY=0, O_WRONLY=1, O_RDWR=2) are identical */
+	int linux_flags = darwin_flags & O_ACCMODE;
+
+	for (const struct flag_pair *p = oflags_map; p->darwin; p++) {
+		if (darwin_flags & p->darwin)
+			linux_flags |= p->linux_val;
+	}
+
+	/* Silently dropped Darwin-only flags:
+	 *   O_SHLOCK/O_EXLOCK — BSD advisory lock at open time
+	 *   O_EVTONLY — kqueue event-only descriptor
+	 *   O_SYMLINK — open symlink itself, not target */
 	return linux_flags;
 }
 
-/* Intercept the Mach-O binary's call to open */
+/* Linux O_flags → Darwin O_flags (for fcntl F_GETFL) */
+static int translate_oflags_to_darwin(int linux_flags)
+{
+	int darwin_flags = linux_flags & O_ACCMODE;
+
+	for (const struct flag_pair *p = oflags_map; p->darwin; p++) {
+		if (linux_flags & p->linux_val)
+			darwin_flags |= p->darwin;
+	}
+
+	return darwin_flags;
+}
+
+static const struct flag_pair atflags_map[] = {
+	{ DARWIN_AT_EACCESS,          AT_EACCESS          },
+	{ DARWIN_AT_SYMLINK_NOFOLLOW, AT_SYMLINK_NOFOLLOW },
+	{ DARWIN_AT_SYMLINK_FOLLOW,   AT_SYMLINK_FOLLOW   },
+	{ DARWIN_AT_REMOVEDIR,        AT_REMOVEDIR        },
+	{ 0, 0 }
+};
+
+/* Darwin AT_flags → Linux AT_flags */
+static int translate_atflags(int darwin_flags)
+{
+	int linux_flags = 0;
+
+	for (const struct flag_pair *p = atflags_map; p->darwin; p++) {
+		if (darwin_flags & p->darwin)
+			linux_flags |= p->linux_val;
+	}
+
+	return linux_flags;
+}
+
+/* Darwin AT_FDCWD (-2) → Linux AT_FDCWD (-100) */
+static int translate_dirfd(int darwin_dirfd)
+{
+	return (darwin_dirfd == DARWIN_AT_FDCWD) ? AT_FDCWD : darwin_dirfd;
+}
+
+/* ---- open() / openat() ---- */
+
 int shim_open(const char *pathname, int flags, ...) __asm__("open");
 int shim_open(const char *pathname, int flags, ...)
 {
 	int linux_flags = translate_oflags(flags);
 	mode_t mode = 0;
 
-	/* Only extract mode if O_CREAT was requested */
 	if (flags & DARWIN_O_CREAT) {
 		va_list args;
 		va_start(args, flags);
@@ -988,18 +1088,13 @@ int shim_open(const char *pathname, int flags, ...)
 		va_end(args);
 	}
 
-	/* aarch64 Linux doesn't have SYS_open, everything goes through SYS_openat */
+	/* aarch64 Linux has no SYS_open; everything goes through SYS_openat */
 	return syscall(SYS_openat, AT_FDCWD, pathname, linux_flags, mode);
 }
 
-/* Intercept the Mach-O binary's call to openat */
 int shim_openat(int dirfd, const char *pathname, int flags, ...) __asm__("openat");
 int shim_openat(int dirfd, const char *pathname, int flags, ...)
 {
-	if (dirfd == DARWIN_AT_FDCWD) {
-		dirfd = AT_FDCWD; /* Translate -2 to -100 */
-	}
-
 	int linux_flags = translate_oflags(flags);
 	mode_t mode = 0;
 
@@ -1010,7 +1105,96 @@ int shim_openat(int dirfd, const char *pathname, int flags, ...)
 		va_end(args);
 	}
 
-	return syscall(SYS_openat, dirfd, pathname, linux_flags, mode);
+	return syscall(SYS_openat, translate_dirfd(dirfd), pathname,
+	               linux_flags, mode);
+}
+
+/* ---- fcntl() ---- */
+
+int shim_fcntl(int fd, int cmd, ...) __asm__("fcntl");
+int shim_fcntl(int fd, int cmd, ...)
+{
+	va_list args;
+	va_start(args, cmd);
+	unsigned long arg = va_arg(args, unsigned long);
+	va_end(args);
+
+	int linux_cmd;
+	switch (cmd) {
+	/* Commands 0–4 (F_DUPFD through F_SETFL) are identical */
+	case 0: case 1: case 2: case 3: case 4:
+		linux_cmd = cmd;
+		break;
+	case DARWIN_F_GETOWN:   linux_cmd = F_GETOWN;  break;
+	case DARWIN_F_SETOWN:   linux_cmd = F_SETOWN;  break;
+	case DARWIN_F_GETLK:    linux_cmd = F_GETLK;   break;
+	case DARWIN_F_SETLK:    linux_cmd = F_SETLK;   break;
+	case DARWIN_F_SETLKW:   linux_cmd = F_SETLKW;  break;
+	case DARWIN_F_FULLFSYNC:
+		/* Best-effort: Linux fsync flushes data + metadata */
+		return fsync(fd);
+	case DARWIN_F_NOCACHE:
+	case DARWIN_F_RDADVISE:
+	case DARWIN_F_RDAHEAD:
+		/* No Linux equivalent; succeed silently */
+		return 0;
+	case DARWIN_F_GETPATH: {
+		/* Implement via /proc/self/fd readlink */
+		char proc_path[32];
+		snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+		ssize_t len = readlink(proc_path, (char *)arg, 1024 - 1);
+		if (len < 0) return -1;
+		((char *)arg)[len] = '\0';
+		return 0;
+	}
+	default:
+		linux_cmd = cmd;
+		break;
+	}
+
+	/* Translate O_flags for F_SETFL */
+	if (cmd == F_SETFL)
+		arg = (unsigned long)translate_oflags((int)arg);
+
+	int ret = syscall(SYS_fcntl, fd, linux_cmd, arg);
+
+	/* Translate O_flags back to Darwin for F_GETFL */
+	if (cmd == F_GETFL && ret >= 0)
+		ret = translate_oflags_to_darwin(ret);
+
+	return ret;
+}
+
+/* ---- shm_open() ---- */
+
+int shim_shm_open(const char *name, int oflag, mode_t mode) __asm__("shm_open");
+int shim_shm_open(const char *name, int oflag, mode_t mode)
+{
+	int linux_flags = translate_oflags(oflag);
+	/* Forward to real shm_open via dlsym to avoid recursion */
+	static int (*real_shm_open)(const char *, int, mode_t) = NULL;
+	if (!real_shm_open) {
+		real_shm_open = dlsym(RTLD_NEXT, "shm_open");
+		if (!real_shm_open) {
+			errno = ENOSYS;
+			return -1;
+		}
+	}
+	return real_shm_open(name, linux_flags, mode);
+}
+
+/* ---- dup3() / pipe2() ---- */
+
+int shim_dup3(int oldfd, int newfd, int flags) __asm__("dup3");
+int shim_dup3(int oldfd, int newfd, int flags)
+{
+	return syscall(SYS_dup3, oldfd, newfd, translate_oflags(flags));
+}
+
+int shim_pipe2(int pipefd[2], int flags) __asm__("pipe2");
+int shim_pipe2(int pipefd[2], int flags)
+{
+	return syscall(SYS_pipe2, pipefd, translate_oflags(flags));
 }
 
 /* ===== stat() ABI translation ===== */
@@ -1144,7 +1328,8 @@ int shim_lstat(const char *path, void *buf)
 int shim_fstatat(int dirfd, const char *path, void *buf, int flags) __asm__("fstatat");
 int shim_fstatat(int dirfd, const char *path, void *buf, int flags)
 {
-	return fstatat_darwin(dirfd, path, buf, flags);
+	return fstatat_darwin(translate_dirfd(dirfd), path, buf,
+	                      translate_atflags(flags));
 }
 
 /* ===== readdir() ABI translation ===== */
