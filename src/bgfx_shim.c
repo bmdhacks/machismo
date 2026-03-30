@@ -321,30 +321,93 @@ bool bgfx_init_wrapper(const void* _init)
 						}
 					}
 
-					/* Now grab EGL state that SDL set up */
-					typedef void* (*egl_get_display_fn)(void);
-					typedef void* (*egl_get_context_fn)(void);
+					/* Grab EGL state that SDL set up.  Multiple strategies
+					 * because the Mali blob and Mesa's libEGL dispatch can
+					 * coexist with separate thread-local state.  All three
+					 * (display/context/surface) must come from the same
+					 * EGL implementation. */
+					typedef void* (*egl_get_fn)(void);
 					typedef void* (*egl_get_surface_fn)(int);
-					egl_get_display_fn egl_get_display =
-						(egl_get_display_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentDisplay");
-					egl_get_context_fn egl_get_context =
-						(egl_get_context_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentContext");
-					egl_get_surface_fn egl_get_surface =
-						(egl_get_surface_fn)dlsym(RTLD_DEFAULT, "eglGetCurrentSurface");
+					typedef void* (*sdl_gl_getproc_fn)(const char*);
 
-					void *egl_display = egl_get_display ? egl_get_display() : NULL;
-					void *egl_context = egl_get_context ? egl_get_context() : NULL;
-					void *egl_surface = egl_get_surface ? egl_get_surface(0x3059 /*EGL_DRAW*/) : NULL;
+					void *egl_display = NULL, *egl_context = NULL, *egl_surface = NULL;
 
-					*ndt = egl_display;
-					*nwh = egl_surface;
-					void** ctx = (void**)(init_copy + INIT_PLATFORM_OFFSET + PLATFORM_CTX_OFFSET);
-					*ctx = egl_context;
+					/* Helper: given a dlsym source, try to grab all three */
+					#define TRY_EGL_FROM(src, label) do { \
+						egl_get_fn _gd = (egl_get_fn)dlsym(src, "eglGetCurrentDisplay"); \
+						if (_gd && (_gd())) { \
+							egl_display = _gd(); \
+							egl_get_fn _gc = (egl_get_fn)dlsym(src, "eglGetCurrentContext"); \
+							egl_get_surface_fn _gs = (egl_get_surface_fn)dlsym(src, "eglGetCurrentSurface"); \
+							egl_context = _gc ? _gc() : NULL; \
+							egl_surface = _gs ? _gs(0x3059 /*EGL_DRAW*/) : NULL; \
+							fprintf(stderr, "bgfx_shim: resolved EGL via %s\n", label); \
+						} \
+					} while(0)
 
+					/* Strategy 1: RTLD_DEFAULT — works when libEGL is global */
+					TRY_EGL_FROM(RTLD_DEFAULT, "RTLD_DEFAULT");
+
+					/* Strategy 2: explicit libEGL.so.1 */
+					if (!egl_display) {
+						void *egl_lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+						if (!egl_lib)
+							egl_lib = dlopen("libEGL.so.1", RTLD_NOW);
+						if (egl_lib)
+							TRY_EGL_FROM(egl_lib, "libEGL.so.1");
+					}
+
+					/* Strategy 3: SDL_GL_GetProcAddress — routes through
+					 * whatever EGL implementation SDL actually loaded
+					 * (e.g. libmali.so vs Mesa dispatch) */
+					if (!egl_display) {
+						sdl_gl_getproc_fn gl_getproc =
+							(sdl_gl_getproc_fn)dlsym(RTLD_DEFAULT, "SDL_GL_GetProcAddress");
+						if (gl_getproc) {
+							egl_get_fn gd = (egl_get_fn)gl_getproc("eglGetCurrentDisplay");
+							if (gd && gd()) {
+								egl_display = gd();
+								egl_get_fn gc = (egl_get_fn)gl_getproc("eglGetCurrentContext");
+								egl_get_surface_fn gs = (egl_get_surface_fn)gl_getproc("eglGetCurrentSurface");
+								egl_context = gc ? gc() : NULL;
+								egl_surface = gs ? gs(0x3059) : NULL;
+								fprintf(stderr, "bgfx_shim: resolved EGL via SDL_GL_GetProcAddress\n");
+							}
+						}
+					}
+
+					/* Strategy 4: libmali.so directly (ARM Mali blob) */
+					if (!egl_display) {
+						void *mali_lib = dlopen("libmali.so", RTLD_NOW | RTLD_NOLOAD);
+						if (mali_lib)
+							TRY_EGL_FROM(mali_lib, "libmali.so");
+					}
+
+					#undef TRY_EGL_FROM
+
+					if (egl_display) {
+						*ndt = egl_display;
+						*nwh = egl_surface;
+						void** ctx = (void**)(init_copy + INIT_PLATFORM_OFFSET + PLATFORM_CTX_OFFSET);
+						*ctx = egl_context;
 						kmsdrm_egl_display = egl_display;
-					kmsdrm_egl_surface = egl_surface;
-					fprintf(stderr, "bgfx_shim: KMSDRM EGL display=%p context=%p surface=%p\n",
-					        egl_display, egl_context, egl_surface);
+						kmsdrm_egl_surface = egl_surface;
+						fprintf(stderr, "bgfx_shim: KMSDRM EGL display=%p context=%p surface=%p\n",
+						        egl_display, egl_context, egl_surface);
+					} else {
+						/* Strategy 5: GBM device from wminfo — let bgfx
+						 * create its own EGL display/context/surface.
+						 * KMSDRM wminfo union (at offset 8):
+						 *   +0: int dev_index, +4: int drm_fd,
+						 *   +8: gbm_device*, +16: gbm_surface* */
+						uint8_t *info_base = (uint8_t *)&wminfo.x11_display;
+						void *gbm_dev     = *(void **)(info_base + 8);
+						void *gbm_surface = *(void **)(info_base + 16);
+						*ndt = gbm_dev;
+						*nwh = gbm_surface;
+						fprintf(stderr, "bgfx_shim: EGL query failed, falling back to GBM: dev=%p surface=%p\n",
+						        gbm_dev, gbm_surface);
+					}
 				} else {
 					fprintf(stderr, "bgfx_shim: unknown SDL subsystem %d\n",
 					        wminfo.subsystem);
