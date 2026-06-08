@@ -181,6 +181,17 @@ void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, u
 		sdl_window_get_drawable_size(win, &ww, &wh);
 		fprintf(stderr, "sdl_window_shim: captured SDL window %p (%dx%d, flags=0x%x)\n",
 		        win, ww, wh, flags);
+	} else {
+		/* SDL_CreateWindow returned NULL — the engine waits forever on a window
+		 * that never appears (seen on Allwinner H700 / Mali-G31 KMSDRM). Surface
+		 * SDL's own reason so the failure is diagnosable instead of silent: the
+		 * usual cause on KMSDRM is that no EGL config matches the requested GLES3
+		 * visual (depth/stencil/double-buffer) on this driver. */
+		const char* (*get_error)(void) =
+		    (const char* (*)(void))dlsym(RTLD_DEFAULT, "SDL_GetError");
+		const char* err = get_error ? get_error() : NULL;
+		fprintf(stderr, "sdl_window_shim: SDL_CreateWindow FAILED (flags=0x%x): %s\n",
+		        flags, (err && *err) ? err : "(no SDL error reported)");
 	}
 	return win;
 }
