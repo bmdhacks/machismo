@@ -33,6 +33,7 @@
 #include "resolver.h"
 #include "trampoline.h"
 #include "gdb_jit.h"
+#include "heaptrack_trace.h"
 #include "patcher.h"
 #include "config.h"
 #include "bgfx_shim.h"
@@ -543,6 +544,24 @@ int main(int argc, char** argv, char** envp)
 		gdb_jit_register_macho((void*)g_macho_dylibs[i].mh,
 		                       g_macho_dylibs[i].slide);
 	}
+
+	/* Heap allocation tracing (heaptrack-compatible). No-op unless
+	 * MACHISMO_HEAPTRACK is set. Register the loaded images' symbol tables so
+	 * guest frames symbolicate. */
+	machismo_heaptrack_init();
+	if (machismo_load_results.mh) {
+		const char* base = strrchr(filename, '/');
+		machismo_heaptrack_add_image((void*)machismo_load_results.mh,
+		                             machismo_load_results.slide,
+		                             base ? base + 1 : filename);
+	}
+	for (int i = 0; i < g_num_macho_dylibs; i++) {
+		const char* base = strrchr(g_macho_dylibs[i].path, '/');
+		machismo_heaptrack_add_image((void*)g_macho_dylibs[i].mh,
+		                             g_macho_dylibs[i].slide,
+		                             base ? base + 1 : g_macho_dylibs[i].path);
+	}
+	atexit(machismo_heaptrack_close);
 
 	/* Apply game-specific binary patches. Any failure (missing symbol,
 	 * unique pattern drift, expect mismatch) is fatal — better to crash

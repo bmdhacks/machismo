@@ -15,6 +15,7 @@ set(MACHISMO_SOURCES
     src/resolver.c
     src/trampoline.c
     src/gdb_jit.c
+    src/heaptrack_trace.c
     src/patcher.c
     src/config.c
     src/bgfx_shim.c
@@ -30,13 +31,13 @@ set(MACHISMO_SOURCES
 add_executable(machismo ${MACHISMO_SOURCES})
 
 target_include_directories(machismo PRIVATE src)
-target_compile_options(machismo PRIVATE -Wall -O2 -g)
+target_compile_options(machismo PRIVATE -Wall -O2 -g -fno-omit-frame-pointer)
 target_compile_definitions(machismo PRIVATE
     INSTALL_PREFIX=""
     SYSTEM_ROOT=""
     _GNU_SOURCE
 )
-target_link_libraries(machismo PRIVATE dl rt pthread m)
+target_link_libraries(machismo PRIVATE dl rt pthread m stdc++)
 target_link_options(machismo PRIVATE -rdynamic)
 
 # --- libsystem_shim.so ---

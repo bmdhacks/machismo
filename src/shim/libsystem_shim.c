@@ -1835,6 +1835,18 @@ static real_free_fn    real_free    = NULL;
 static real_calloc_fn  real_calloc  = NULL;
 static real_realloc_fn real_realloc = NULL;
 
+/* Optional heaptrack hooks, implemented in the machismo executable and resolved
+ * once via dlsym(RTLD_DEFAULT) (the loader links -rdynamic). When MACHISMO_HEAPTRACK
+ * is unset, *ht_active stays 0 and the hooks are never called. See heaptrack_trace.c. */
+typedef void (*ht_alloc_fn)(void *, size_t);
+typedef void (*ht_free_fn)(void *);
+typedef void (*ht_realloc_fn)(void *, void *, size_t);
+static int           *ht_active  = NULL;
+static ht_alloc_fn    ht_alloc   = NULL;
+static ht_free_fn     ht_free    = NULL;
+static ht_realloc_fn  ht_realloc = NULL;
+#define HT_ON() (ht_active && *ht_active)
+
 /* Bootstrap: dlsym itself may call malloc, so we need a tiny fallback
  * allocator for the very first calls before dlsym resolves. */
 static char bootstrap_buf[4096];
@@ -1847,6 +1859,12 @@ static void resolve_real_funcs(void)
 	real_free    = (real_free_fn)dlsym(RTLD_NEXT, "free");
 	real_calloc  = (real_calloc_fn)dlsym(RTLD_NEXT, "calloc");
 	real_realloc = (real_realloc_fn)dlsym(RTLD_NEXT, "realloc");
+
+	/* Resolve heaptrack hooks from the loader (past bootstrap, so dlsym is safe). */
+	ht_active  = (int *)dlsym(RTLD_DEFAULT, "machismo_heaptrack_active");
+	ht_alloc   = (ht_alloc_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_alloc");
+	ht_free    = (ht_free_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_free");
+	ht_realloc = (ht_realloc_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_realloc");
 }
 
 void *shim_malloc(size_t size) __asm__("malloc");
@@ -1870,6 +1888,7 @@ void *shim_malloc(size_t size)
 	void *p = real_malloc(size);
 	if (p)
 		memset(p, 0, size);
+	if (p && HT_ON()) ht_alloc(p, size);
 	return p;
 }
 
@@ -1888,6 +1907,7 @@ void shim_free(void *ptr)
 		return;
 	}
 	if (!real_free) resolve_real_funcs();
+	if (HT_ON()) ht_free(ptr);
 	if (real_free) real_free(ptr);
 }
 
@@ -1903,6 +1923,7 @@ void *shim_calloc(size_t nmemb, size_t size)
 		}
 	}
 	void *p = real_calloc(nmemb, size);
+	if (p && HT_ON()) ht_alloc(p, nmemb * size);
 	return p;
 }
 
@@ -1912,5 +1933,6 @@ void *shim_realloc(void *ptr, size_t size)
 	if (!real_realloc) resolve_real_funcs();
 	if (!real_realloc) return NULL;
 	void *new_ptr = real_realloc(ptr, size);
+	if (HT_ON()) ht_realloc(ptr, new_ptr, size);
 	return new_ptr;
 }
