@@ -1716,6 +1716,13 @@ struct dirent *shim_readdir_r(DIR *dirp, void *entry, void **result)
 #define DARWIN_MAP_ANON  0x1000
 #define DARWIN_MAP_JIT   0x0800
 
+/* Heaptrack mmap/munmap feeds — defined with the other ht_* hook plumbing in
+ * the heap-wrapper section below (the hook statics live there). The tracer
+ * itself filters for resident-relevant mappings (anonymous / tmpfs / device)
+ * and ignores regular-file page cache. */
+static void shim_ht_mmap_event(void *ret, size_t length, int prot, int flags, int fd);
+static void shim_ht_munmap_event(void *addr, size_t length);
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
 	static void *(*real_mmap)(void*, size_t, int, int, int, off_t) = NULL;
@@ -1730,7 +1737,22 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 	/* Strip macOS-only MAP_JIT (0x0800) */
 	flags &= ~DARWIN_MAP_JIT;
 
-	return real_mmap(addr, length, prot, flags, fd, offset);
+	void *ret = real_mmap(addr, length, prot, flags, fd, offset);
+	if (ret != MAP_FAILED)
+		shim_ht_mmap_event(ret, length, prot, flags, fd);
+	return ret;
+}
+
+int munmap(void *addr, size_t length)
+{
+	static int (*real_munmap)(void *, size_t) = NULL;
+	if (!real_munmap)
+		real_munmap = dlsym(RTLD_NEXT, "munmap");
+
+	int ret = real_munmap(addr, length);
+	if (ret == 0)
+		shim_ht_munmap_event(addr, length);
+	return ret;
 }
 
 /* ===== mmap registry ===== */
@@ -1841,10 +1863,14 @@ static real_realloc_fn real_realloc = NULL;
 typedef void (*ht_alloc_fn)(void *, size_t);
 typedef void (*ht_free_fn)(void *);
 typedef void (*ht_realloc_fn)(void *, void *, size_t);
+typedef void (*ht_mmap_fn)(void *, size_t, int, int, int);
+typedef void (*ht_munmap_fn)(void *, size_t);
 static int           *ht_active  = NULL;
 static ht_alloc_fn    ht_alloc   = NULL;
 static ht_free_fn     ht_free    = NULL;
 static ht_realloc_fn  ht_realloc = NULL;
+static ht_mmap_fn     ht_mmap    = NULL;
+static ht_munmap_fn   ht_munmap  = NULL;
 #define HT_ON() (ht_active && *ht_active)
 
 /* Bootstrap: dlsym itself may call malloc, so we need a tiny fallback
@@ -1865,6 +1891,22 @@ static void resolve_real_funcs(void)
 	ht_alloc   = (ht_alloc_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_alloc");
 	ht_free    = (ht_free_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_free");
 	ht_realloc = (ht_realloc_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_realloc");
+	ht_mmap    = (ht_mmap_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_mmap");
+	ht_munmap  = (ht_munmap_fn)dlsym(RTLD_DEFAULT, "machismo_heaptrack_munmap");
+}
+
+/* mmap/munmap → tracer feeds (called from the interposers above). Resolve
+ * lazily like the malloc path — an mmap can arrive before the first malloc;
+ * the wrapper already assumes dlsym works there (it resolves real_mmap). */
+static void shim_ht_mmap_event(void *ret, size_t length, int prot, int flags, int fd)
+{
+	if (!ht_active) resolve_real_funcs();
+	if (HT_ON() && ht_mmap) ht_mmap(ret, length, prot, flags, fd);
+}
+
+static void shim_ht_munmap_event(void *addr, size_t length)
+{
+	if (HT_ON() && ht_munmap) ht_munmap(addr, length);
 }
 
 void *shim_malloc(size_t size) __asm__("malloc");

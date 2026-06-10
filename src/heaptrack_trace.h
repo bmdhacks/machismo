@@ -43,6 +43,19 @@ void machismo_heaptrack_alloc(void *ptr, size_t size);
 void machismo_heaptrack_free(void *ptr);
 void machismo_heaptrack_realloc(void *old_ptr, void *new_ptr, size_t size);
 
+/* mmap hooks — invoked by the shim's mmap/munmap interposers. Only
+ * RESIDENT-relevant mappings are recorded: anonymous (fd < 0), tmpfs/shm
+ * (memfd, /dev/shm — swap-backed, not disk-evictable) and device mappings
+ * (e.g. /dev/mali0 — pinned kernel/CMA memory, the GPU storage on shared-mem
+ * Mali devices). Regular-file mappings are evictable page cache and are
+ * SKIPPED so the trace converges on the same definition of "memory that
+ * matters" as smaps_rollup Anonymous. Each event carries the caller stack
+ * plus a synthetic leaf frame ("mmap(anonymous)" / "mmap(/dev/mali0)") so
+ * flamegraphs separate mapped memory by category. `flags` are the translated
+ * (Linux) flags. Partial munmaps split the tracked region correctly. */
+void machismo_heaptrack_mmap(void *ptr, size_t length, int prot, int flags, int fd);
+void machismo_heaptrack_munmap(void *ptr, size_t length);
+
 #ifdef __cplusplus
 }
 #endif
