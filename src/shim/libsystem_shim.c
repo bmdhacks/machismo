@@ -1873,6 +1873,33 @@ static ht_mmap_fn     ht_mmap    = NULL;
 static ht_munmap_fn   ht_munmap  = NULL;
 #define HT_ON() (ht_active && *ht_active)
 
+/* A port can route classes of guest allocations to its own backing store
+ * (e.g. Gothic's file-backed audio-PCM arena, which makes the decoded sound
+ * bank evictable instead of pinned anon RAM). Installed once at port init via
+ * machismo_set_alloc_router():
+ *   alloc(size)  — return a ZEROED allocation, or NULL to decline (the call
+ *                  then falls through to the normal heap). Mach-O code assumes
+ *                  macOS's zeroed malloc, so the router owns that contract —
+ *                  shim_malloc does NOT memset routed memory (the router's
+ *                  pages may be purposely lazy; a blanket memset would dirty
+ *                  them all up front).
+ *   free(ptr)    — nonzero if ptr was routed and has been released.
+ *   usable(ptr)  — a routed allocation's requested size, 0 if not routed
+ *                  (lets shim_realloc migrate routed pointers off the arena).
+ * All three must be cheap for non-routed pointers (a range check). */
+static void  *(*alloc_router)(size_t)        = NULL;
+static int    (*free_router)(void *)         = NULL;
+static size_t (*usable_router)(void *)       = NULL;
+
+void machismo_set_alloc_router(void *(*alloc_fn)(size_t),
+                               int (*free_fn)(void *),
+                               size_t (*usable_fn)(void *))
+{
+	alloc_router  = alloc_fn;
+	free_router   = free_fn;
+	usable_router = usable_fn;
+}
+
 /* Bootstrap: dlsym itself may call malloc, so we need a tiny fallback
  * allocator for the very first calls before dlsym resolves. */
 static char bootstrap_buf[4096];
@@ -1926,6 +1953,13 @@ void *shim_malloc(size_t size)
 			return NULL;
 		}
 	}
+	if (alloc_router) {
+		void *p = alloc_router(size);
+		if (p) {	/* router memory is pre-zeroed (contract) */
+			if (HT_ON()) ht_alloc(p, size);
+			return p;
+		}
+	}
 	/* macOS malloc returns zeroed pages — zero-init for compatibility. */
 	void *p = real_malloc(size);
 	if (p)
@@ -1942,6 +1976,10 @@ void shim_free(void *ptr)
 	if ((char *)ptr >= bootstrap_buf &&
 	    (char *)ptr < bootstrap_buf + sizeof(bootstrap_buf))
 		return;
+	if (free_router && free_router(ptr)) {
+		if (HT_ON()) ht_free(ptr);
+		return;
+	}
 	/* Check mmap registry: munmap instead of free for mmap'd regions */
 	size_t mmap_size = mmap_registry_remove(ptr);
 	if (mmap_size) {
@@ -1972,6 +2010,18 @@ void *shim_calloc(size_t nmemb, size_t size)
 void *shim_realloc(void *ptr, size_t size) __asm__("realloc");
 void *shim_realloc(void *ptr, size_t size)
 {
+	if (usable_router && ptr) {
+		size_t old = usable_router(ptr);
+		if (old) {
+			/* Routed allocation — the real heap can't realloc it. Migrate. */
+			void *np = shim_malloc(size);
+			if (np && size)
+				memcpy(np, ptr, old < size ? old : size);
+			if (np || !size)
+				shim_free(ptr);
+			return np;
+		}
+	}
 	if (!real_realloc) resolve_real_funcs();
 	if (!real_realloc) return NULL;
 	void *new_ptr = real_realloc(ptr, size);
