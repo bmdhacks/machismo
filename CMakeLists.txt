@@ -16,6 +16,7 @@ set(MACHISMO_SOURCES
     src/trampoline.c
     src/gdb_jit.c
     src/heaptrack_trace.c
+    src/crash_handler.c
     src/patcher.c
     src/config.c
     src/bgfx_shim.c
@@ -91,6 +92,15 @@ if(BUILD_TESTS)
     target_compile_options(test_necrolevel_rng PRIVATE -Wall -O2 -g)
     target_compile_definitions(test_necrolevel_rng PRIVATE _GNU_SOURCE)
     target_link_libraries(test_necrolevel_rng PRIVATE dl m)
+
+    # Crash handler: -O0 + frame pointers so the test's call chain unwinds
+    # deterministically (the handler itself, in machismo, is built with frame
+    # pointers regardless).
+    add_executable(test_crash_handler tests/test_crash_handler.c src/crash_handler.c)
+    target_include_directories(test_crash_handler PRIVATE src)
+    target_compile_options(test_crash_handler PRIVATE -Wall -g -O0 -fno-omit-frame-pointer)
+    target_compile_definitions(test_crash_handler PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_crash_handler PRIVATE pthread)
 endif()
 
 # --- per-game shim libraries (libgame_patches, libsugar_patches_*, pcm_cache_write) ---

@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "dthreads.h"
+#include "crash_handler.h"
 
 static __thread jmp_buf t_jmpbuf;
 static __thread void* t_freeaddr;
@@ -175,6 +176,11 @@ static void* darling_thread_entry(void* p)
 	if (arg3_val == 0) {
 		arg3_val = (uintptr_t) args.stack_bottom;
 	}
+
+	/* Give this guest thread its own alternate signal stack so a stack-overflow
+	 * fault here can still run the crash handler (the handler's disposition is
+	 * process-wide and already covers ordinary faults on every thread). */
+	crash_handler_register_thread();
 
 #ifdef __aarch64__
 	register void*     r_arg1 asm("x0") = args.pth;

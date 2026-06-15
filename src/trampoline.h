@@ -65,4 +65,12 @@ int trampoline_patch(void* mh, uintptr_t slide);
 void trampoline_guard_stale_data(void* mh, uintptr_t slide,
                                   const char** prefixes, int num_prefixes);
 
+/*
+ * Report whether a faulting address lies in a __DATA page guarded by
+ * trampoline_guard_stale_data (stale Mach-O library-data access). Used by the
+ * unified crash handler to label such faults. Returns 1 if guarded, else 0.
+ * Pure array reads — safe to call from a signal handler.
+ */
+int trampoline_is_guarded_fault(uintptr_t addr);
+
 #endif /* _TRAMPOLINE_H_ */

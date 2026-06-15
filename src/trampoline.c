@@ -603,32 +603,21 @@ static struct {
 } guarded_pages[MAX_GUARDED_PAGES];
 static int num_guarded_pages = 0;
 
-static void stale_data_sigsegv(int sig, siginfo_t* info, void* ucontext)
+/* Classifier for the unified crash handler (crash_handler.c, the sole
+ * fatal-signal owner). Reports whether a faulting address lies in a __DATA page
+ * we guarded against stale Mach-O access — un-trampolined or inlined code
+ * touching Mach-O library state instead of the native .so. The crash handler
+ * prints the stale-data diagnostic (async-signal-safe) and continues into the
+ * unified cross-world backtrace, so this no longer installs a SIGSEGV handler
+ * or aborts on its own. Safe to call from a signal context: pure array reads. */
+int trampoline_is_guarded_fault(uintptr_t addr)
 {
-	uintptr_t fault_addr = (uintptr_t)info->si_addr;
-
-	/* Check if fault is in a guarded page */
 	for (int i = 0; i < num_guarded_pages; i++) {
-		if (fault_addr >= guarded_pages[i].base &&
-		    fault_addr < guarded_pages[i].base + guarded_pages[i].size) {
-			ucontext_t* uc = (ucontext_t*)ucontext;
-			uintptr_t pc = uc->uc_mcontext.pc;
-			fprintf(stderr,
-				"\nFATAL: stale Mach-O data access at %p from PC=%p\n"
-				"This means un-trampolined or inlined code is accessing\n"
-				"Mach-O library state instead of native .so state.\n",
-				(void*)fault_addr, (void*)pc);
-			abort();
-		}
+		if (addr >= guarded_pages[i].base &&
+		    addr < guarded_pages[i].base + guarded_pages[i].size)
+			return 1;
 	}
-
-	/* Not our fault — re-raise with default handler */
-	struct sigaction sa;
-	sa.sa_handler = SIG_DFL;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-	sigaction(SIGSEGV, &sa, NULL);
-	raise(SIGSEGV);
+	return 0;
 }
 
 void trampoline_guard_stale_data(void* mh, uintptr_t slide,
@@ -743,14 +732,10 @@ void trampoline_guard_stale_data(void* mh, uintptr_t slide,
 	free(has_library);
 	free(has_other);
 
-	/* Install SIGSEGV handler */
-	if (guarded > 0) {
-		struct sigaction sa;
-		sa.sa_sigaction = stale_data_sigsegv;
-		sigemptyset(&sa.sa_mask);
-		sa.sa_flags = SA_SIGINFO;
-		sigaction(SIGSEGV, &sa, NULL);
-	}
+	/* No SIGSEGV handler installed here: crash_handler.c is the single
+	 * fatal-signal owner and queries trampoline_is_guarded_fault() to surface
+	 * the stale-data diagnostic above as part of its unified backtrace. The
+	 * pages stay PROT_NONE so a stale access still faults. */
 
 	fprintf(stderr, "trampoline: __DATA guard: %d library data symbols, "
 	        "%d pages guarded, %d mixed pages (cannot guard)\n",

@@ -41,6 +41,7 @@
 #include "eh_frame.h"
 #include "dylib_loader.h"
 #include "isa_emul.h"
+#include "crash_handler.h"
 #include <sys/resource.h>
 #include <pthread.h>
 
@@ -579,6 +580,11 @@ int main(int argc, char** argv, char** envp)
 	setup_stack64(filename, &machismo_load_results);
 
 	__machismo_main_stack_top = (void*)machismo_load_results.stack_top;
+
+	/* Install the cross-world (ELF + Mach-O) crash handler now: all images and
+	 * the trampoline __DATA guard pages exist, and all guest code runs after
+	 * this point. It owns the fatal signals for the rest of the process. */
+	crash_handler_init();
 
 	start_thread(&machismo_load_results);
 

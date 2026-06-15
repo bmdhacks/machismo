@@ -2,6 +2,7 @@
 #define _MACHISMO_HEAPTRACK_TRACE_H_
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Built-in heaptrack-compatible allocation tracer for machismo.
@@ -37,6 +38,16 @@ void machismo_heaptrack_close(void);   /* flush + close; registered via atexit *
  * guest runs. module_name is copied. */
 void machismo_heaptrack_add_image(void *mh, unsigned long slide,
                                   const char *module_name);
+
+/* Nearest-preceding-symbol lookup over the reverse Mach-O index built by
+ * machismo_heaptrack_add_image (always built at load, regardless of whether
+ * tracing is active). Returns 1 and fills the symbol name (Mach-O mangled, with
+ * leading underscore) + module basename, plus the symbol's runtime base address
+ * in *out_base when non-NULL; returns 0 if no symbol is within range. The index
+ * is frozen after the single-threaded load phase, so this performs only
+ * lock-free reads and is safe to call from a signal handler (crash_handler). */
+int ht_lookup_sym(uint64_t ip, const char **out_fn, const char **out_mod,
+                  uint64_t *out_base);
 
 /* Allocation hooks — invoked by the shim (resolved via dlsym RTLD_DEFAULT). */
 void machismo_heaptrack_alloc(void *ptr, size_t size);

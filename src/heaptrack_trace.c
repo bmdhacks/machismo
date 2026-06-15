@@ -279,11 +279,15 @@ void machismo_heaptrack_add_image(void *mh_ptr, unsigned long slide,
 	g_in_hook = 0;
 }
 
-/* Nearest preceding symbol. Returns 1 + fills *out_fn / *out_mod, else 0.
+/* Nearest preceding symbol. Returns 1 + fills *out_fn / *out_mod (+ the matched
+ * symbol's runtime base in *out_base if non-NULL), else 0.
  * Called with NO lock — safe because the index is append-then-sort inside
  * add_image (single-threaded load phase, self-feeds latched) and frozen by
- * the time concurrent readers exist. Never sorts here: that was a data race. */
-static int ht_lookup_sym(uint64_t ip, const char **out_fn, const char **out_mod) {
+ * the time concurrent readers exist. Never sorts here: that was a data race.
+ * Non-static + async-signal-safe (pure reads over the frozen sorted array, no
+ * locks/malloc) so the crash handler can reuse it from a signal context. */
+int ht_lookup_sym(uint64_t ip, const char **out_fn, const char **out_mod,
+                  uint64_t *out_base) {
 	if (!g_nsyms || !g_syms_sorted) return 0;
 	/* Greatest addr <= ip. */
 	size_t lo = 0, hi = g_nsyms;   /* find first addr > ip, then step back */
@@ -297,6 +301,7 @@ static int ht_lookup_sym(uint64_t ip, const char **out_fn, const char **out_mod)
 	if (ip - s->addr > HT_MAX_SYM_DISTANCE) return 0;
 	*out_fn = s->name;
 	*out_mod = s->module;
+	if (out_base) *out_base = s->addr;
 	return 1;
 }
 
@@ -364,7 +369,7 @@ static int lookup_ip(void *addr) {
 static void ht_resolve_unlocked(struct ht_ipres *r) {
 	const char *fn = NULL, *mod = NULL;
 	r->fn = "??"; r->mod = "??"; r->dem = NULL;
-	if (ht_lookup_sym((uint64_t)(uintptr_t)r->addr, &fn, &mod)) {
+	if (ht_lookup_sym((uint64_t)(uintptr_t)r->addr, &fn, &mod, NULL)) {
 		r->mod = mod;
 		r->fn = fn[0] == '_' ? fn + 1 : fn;          /* drop Mach-O '_' */
 	} else {
