@@ -120,6 +120,7 @@ static uintptr_t get_stub_island(void)
  */
 static void* try_mangling_variants(void* lib, const char* name)
 {
+	extern int machismo_verbose;
 	size_t len = strlen(name);
 
 	/* Collect positions of 'y' characters */
@@ -143,7 +144,8 @@ static void* try_mangling_variants(void* lib, const char* name)
 		}
 		void* addr = dlsym(lib, buf);
 		if (addr) {
-			fprintf(stderr, "trampoline: mangling fallback: %s -> %s\n", name, buf);
+			if (machismo_verbose)
+				fprintf(stderr, "trampoline: mangling fallback: %s -> %s\n", name, buf);
 			free(buf);
 			return addr;
 		}
@@ -164,7 +166,8 @@ static void* try_mangling_variants(void* lib, const char* name)
 		}
 		void* addr = dlsym(lib, buf);
 		if (addr) {
-			fprintf(stderr, "trampoline: mangling fallback: %s -> %s\n", name, buf);
+			if (machismo_verbose)
+				fprintf(stderr, "trampoline: mangling fallback: %s -> %s\n", name, buf);
 			free(buf);
 			return addr;
 		}

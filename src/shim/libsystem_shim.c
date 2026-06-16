@@ -1777,7 +1777,6 @@ void mmap_registry_add(void *addr, size_t size)
 	mmap_registry[mmap_registry_count].addr = addr;
 	mmap_registry[mmap_registry_count].size = size;
 	mmap_registry_count++;
-	fprintf(stderr, "mmap_registry: registered %p (%zu bytes)\n", addr, size);
 }
 
 /* Returns size if found and removed, 0 if not found */

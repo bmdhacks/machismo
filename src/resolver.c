@@ -186,6 +186,7 @@ static int wrapped_lua_pcall(void *L, int nargs, int nres, int errfunc)
  */
 static void* try_mangling_variants(void* lib, const char* name)
 {
+	extern int machismo_verbose;
 	size_t len = strlen(name);
 
 	int y_pos[16];
@@ -206,7 +207,8 @@ static void* try_mangling_variants(void* lib, const char* name)
 		}
 		void* addr = dlsym(lib, buf);
 		if (addr) {
-			fprintf(stderr, "resolver: mangling fallback: %s -> %s\n", name, buf);
+			if (machismo_verbose)
+				fprintf(stderr, "resolver: mangling fallback: %s -> %s\n", name, buf);
 			free(buf);
 			return addr;
 		}
@@ -227,7 +229,8 @@ static void* try_mangling_variants(void* lib, const char* name)
 		}
 		void* addr = dlsym(lib, buf);
 		if (addr) {
-			fprintf(stderr, "resolver: mangling fallback: %s -> %s\n", name, buf);
+			if (machismo_verbose)
+				fprintf(stderr, "resolver: mangling fallback: %s -> %s\n", name, buf);
 			free(buf);
 			return addr;
 		}
