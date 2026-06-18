@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 14)
 
 option(BUILD_WRAPGEN "Build the wrapgen utility" ON)
 option(BUILD_TESTS "Build test fixtures" ON)
+# Process-wide host-library malloc/mmap interposition for the built-in heaptrack
+# tracer. OFF by default: when off the exe does not interpose host allocations at
+# all (zero overhead, and it dodges the lazy-resolver recursion that stack-
+# overflowed on an ArkOS device build). Turn ON only for a leak-hunting build;
+# the reverse-symbol index used by the crash handler is always compiled in, and
+# guest-side tracing via the libsystem shim still works regardless. See
+# src/heaptrack_trace.c.
+option(MACHISMO_HEAPTRACK_BUILD "Interpose host-library malloc/mmap for heaptrack tracing" OFF)
 
 # --- machismo loader executable ---
 
@@ -38,6 +46,9 @@ target_compile_definitions(machismo PRIVATE
     SYSTEM_ROOT=""
     _GNU_SOURCE
 )
+if(MACHISMO_HEAPTRACK_BUILD)
+    target_compile_definitions(machismo PRIVATE MACHISMO_HEAPTRACK_BUILD)
+endif()
 target_link_libraries(machismo PRIVATE dl rt pthread m stdc++)
 target_link_options(machismo PRIVATE -rdynamic)
 

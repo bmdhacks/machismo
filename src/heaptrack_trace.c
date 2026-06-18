@@ -999,6 +999,26 @@ void machismo_heaptrack_realloc(void *old_ptr, void *new_ptr, size_t size) {
 	g_in_hook = 0;
 }
 
+/* ---- Process-wide host-library interposition (build-time opt-in) ---- */
+/* The exported mmap/munmap + malloc-family definitions below interpose EVERY
+ * host-library allocation (libmali, mesa, SDL, glibc-internal callers) on every
+ * run — they are linked into the -rdynamic exe, which is first in the global
+ * scope. That is pure overhead, and a liability, when we are not profiling:
+ * the lazy resolver (hresolve -> dlsym) sits in the hot path of the very first
+ * allocation and, on at least one device toolchain, recursed to a stack-overflow
+ * SIGSEGV (ArkOS, 2026-06-18). So the whole host-interposition block is gated
+ * behind MACHISMO_HEAPTRACK_BUILD (default OFF). When it is off, host malloc/
+ * mmap simply bind to glibc directly with zero indirection.
+ *
+ * What stays unconditional: the reverse Mach-O symbol index
+ * (machismo_heaptrack_add_image / ht_lookup_sym / g_syms) — the always-on crash
+ * handler depends on it — plus the guest-side hooks, which the libsystem shim
+ * still calls (gated at runtime by machismo_heaptrack_active). So a profiling
+ * build (cmake -DMACHISMO_HEAPTRACK_BUILD=ON) restores full host+guest tracing;
+ * a normal build keeps guest-side tracing available via the shim but pays none
+ * of the host-interposition cost. */
+#ifdef MACHISMO_HEAPTRACK_BUILD
+
 /* ---- Process-wide mmap/munmap interposition (host libraries) ---- */
 /* The GUEST's mmap reaches the libsystem shim's Darwin-flag-translating wrapper
  * via per-handle dlsym (dylib_map), so it is covered there. HOST libraries
@@ -1105,7 +1125,19 @@ int dlclose(void *handle)
 
 static char   hboot_buf[65536] __attribute__((aligned(16)));
 static size_t hboot_off;
-static int    hresolving;
+/* Reentrancy latch for the lazy resolver. MUST be volatile + thread-local:
+ * hresolve() calls dlsym(), whose glibc internals call calloc() (via
+ * _dlerror_run, to allocate the per-thread __libc_dlerror_result), which
+ * re-enters our calloc() interposer on the SAME thread. The guard below
+ * (`if (hresolving) return hboot_alloc(...)`) breaks that loop. Because this
+ * flag is static and its address is never taken, a non-volatile int lets the
+ * compiler keep `hresolving = 1` in a register and never commit it to memory
+ * across the opaque dlsym() call — the re-entrant calloc then reads 0 from
+ * memory, the guard misses, and we recurse until the stack overflows (SIGSEGV).
+ * Observed on an ArkOS device build; the dev-host toolchain happened to spill
+ * the store. volatile forces a real load/store; __thread keeps the latch
+ * correct if two threads bootstrap concurrently. */
+static __thread volatile int hresolving;
 
 static int hboot_owns(const void *p)
 {
@@ -1220,6 +1252,8 @@ int munmap(void *addr, size_t length)
 		machismo_heaptrack_munmap(addr, length);
 	return ret;
 }
+
+#endif /* MACHISMO_HEAPTRACK_BUILD — host-library interposition */
 
 /* ---- Lifecycle ---- */
 
