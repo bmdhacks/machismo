@@ -38,6 +38,7 @@ typedef struct {
 typedef struct {
 	char* dylib_map;
 	char* patches;
+	char* splash_image;                      /* early KMS load splash PNG (relative to CWD) */
 	machismo_trampoline_config_t trampolines[CONFIG_MAX_TRAMPOLINES];
 	int num_trampolines;
 } machismo_config_t;

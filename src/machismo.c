@@ -42,6 +42,7 @@
 #include "dylib_loader.h"
 #include "isa_emul.h"
 #include "crash_handler.h"
+#include "splash_kms.h"
 #include <sys/resource.h>
 #include <pthread.h>
 
@@ -169,6 +170,14 @@ int main(int argc, char** argv, char** envp)
 			}
 		}
 	}
+
+	/* Put the load splash on the panel before the slow work below (LSE patch,
+	 * fixup resolve, then the game's own asset/shader load) so the user gets
+	 * immediate visual feedback instead of a black screen. Fail-soft; the splash
+	 * drops the DRM master and persists on screen until the game's first frame
+	 * replaces it (machismo_splash_teardown reclaims it then). See splash_kms.c. */
+	if (cfg.splash_image)
+		machismo_splash_show(cfg.splash_image);
 
 	/* LSE emulation state — shared between main exe and dylib patching */
 	uint32_t *lse_pool_cur = NULL;

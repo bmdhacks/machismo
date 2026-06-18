@@ -30,6 +30,7 @@ set(MACHISMO_SOURCES
     src/bgfx_shim.c
     src/fps.c
     src/sdl_window_shim.c
+    src/splash_kms.c
     src/eh_frame.c
     src/dylib_loader.c
     src/isa_emul.c
@@ -52,6 +53,24 @@ if(MACHISMO_HEAPTRACK_BUILD)
 endif()
 target_link_libraries(machismo PRIVATE dl rt pthread m stdc++)
 target_link_options(machismo PRIVATE -rdynamic)
+
+# libdrm powers the early in-process KMS load splash (src/splash_kms.c). We use
+# its HEADERS at build time but resolve the library itself via dlopen at runtime
+# (never linked) — machismo is built on a host that ships libdrm but deployed to
+# handhelds that may not, and a NEEDED libdrm.so.2 would make the dynamic loader
+# refuse to start machismo there. With dlopen the splash just no-ops when libdrm
+# is absent. When the headers themselves are missing the splash compiles to inert
+# stubs. (dl is already linked above.)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBDRM libdrm)
+endif()
+if(LIBDRM_FOUND)
+    target_include_directories(machismo PRIVATE ${LIBDRM_INCLUDE_DIRS})
+    target_compile_definitions(machismo PRIVATE HAVE_LIBDRM)
+else()
+    message(STATUS "machismo: libdrm headers not found — early KMS load splash disabled")
+endif()
 
 # --- libsystem_shim.so ---
 

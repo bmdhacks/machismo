@@ -90,6 +90,9 @@ int config_load(const char* path, machismo_config_t* cfg)
 			} else if (strcmp(key, "patches") == 0) {
 				free(cfg->patches);
 				cfg->patches = strdup(val);
+			} else if (strcmp(key, "splash_image") == 0) {
+				free(cfg->splash_image);
+				cfg->splash_image = strdup(val);
 			}
 		}
 	}
