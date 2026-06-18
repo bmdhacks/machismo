@@ -31,6 +31,7 @@
 
 #include "bgfx_shim.h"
 #include "sdl_window_shim.h"   /* SDL window glue (capture, native handle, sizes) */
+#include "fps.h"               /* MACHISMO_FPS frame-rate reporter */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -442,6 +443,7 @@ uint32_t bgfx_frame_wrapper(bool capture)
 			swap_fn(swap_win);
 	}
 
+	machismo_fps_tick();   /* MACHISMO_FPS: one displayed frame */
 	return result;
 }
 
