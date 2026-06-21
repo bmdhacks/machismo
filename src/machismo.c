@@ -434,6 +434,17 @@ int main(int argc, char** argv, char** envp)
 			if (tc->override_lib) {
 				void* oh = dlopen(tc->override_lib, RTLD_LAZY);
 				if (oh) {
+					/* If this override lib chooses the render backend (the Gothic
+					 * shim does), ask it NOW — before the game creates its SDL
+					 * window — so the window shim can pick SDL_WINDOW_VULKAN vs
+					 * SDL_WINDOW_OPENGL to match. The decision is memoized inside
+					 * the override lib, so the renderer's later select_backend()
+					 * returns the identical answer. Soft: non-Gothic override libs
+					 * don't export this symbol, so it's a no-op for them. */
+					int (*be_is_vk)(void) =
+						(int (*)(void))dlsym(oh, "gothic_backend_is_vulkan");
+					if (be_is_vk)
+						sdl_window_set_vulkan(be_is_vk());
 					trampoline_patch_overrides(
 						(void*)machismo_load_results.mh,
 						machismo_load_results.slide, oh,

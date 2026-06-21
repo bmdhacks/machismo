@@ -46,6 +46,17 @@ typedef struct {
  * fullscreen on KMSDRM, and captures the resulting SDL_Window*. */
 void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, unsigned int flags);
 
+/* Tell the window shim which GPU flag the next created window needs (1 = Vulkan →
+ * SDL_WINDOW_VULKAN, 0 = GLES → SDL_WINDOW_OPENGL on KMSDRM). The loader sets this
+ * from the render override lib's backend decision before the window is created, so
+ * the flag matches the backend that will actually be installed. */
+void sdl_window_set_vulkan(int is_vulkan);
+
+/* Drop SDL's DRM master on the KMSDRM display so a direct-display Vulkan driver
+ * (libmali VK_KHR_display) can acquire it. Returns the ioctl rc (0 = ok), or -1
+ * off KMSDRM. See the .c for why this is required. */
+int sdl_window_kmsdrm_drop_master(void* window);
+
 /* Blocks fullscreen transitions (macOS changes the display mode to the game's
  * resolution; Linux/Wayland can't, so fullscreen yields a native-res surface
  * while the game's viewports stay at its internal resolution — broken). */

@@ -11,12 +11,17 @@
 #include <string.h>
 #include <stdlib.h>
 #include <dlfcn.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <dirent.h>
+#include <unistd.h>
 
 /* SDL window flag bits (SDL2 values; identical under SDL3/SDL2-compat). */
 #define SDL_WINDOW_FULLSCREEN         0x00000001
 #define SDL_WINDOW_OPENGL             0x00000002
 #define SDL_WINDOW_FULLSCREEN_DESKTOP 0x00001001
 #define SDL_WINDOW_ALLOW_HIGHDPI      0x00002000
+#define SDL_WINDOW_VULKAN             0x10000000
 #define SDL_WINDOW_METAL              0x20000000
 
 /* SDL_GLattr enum values (SDL2 ABI; stable). Used to request a GLES3 config
@@ -46,6 +51,83 @@ static void  (*sdl_GL_GetDrawableSize)(void*, int*, int*) = NULL;
 
 /* The SDL window captured by sdl_create_window_wrapper. */
 static void* captured_sdl_window = NULL;
+
+/* Render-backend hint pushed by the loader before the game creates its window.
+ * -1 = unknown (not a backend-selecting override lib), 0 = GLES, 1 = Vulkan.
+ * Set from machismo.c via the override lib's gothic_backend_is_vulkan(), so the
+ * window's GPU flag (SDL_WINDOW_VULKAN vs SDL_WINDOW_OPENGL) always matches the
+ * backend the renderer actually installs. */
+static int backend_is_vulkan = -1;
+
+void sdl_window_set_vulkan(int is_vulkan)
+{
+	backend_is_vulkan = is_vulkan ? 1 : 0;
+}
+
+/* Hand the KMSDRM display off to a Vulkan driver that owns it directly.
+ *
+ * SDL's KMSDRM video driver grabs the DRM master when it modesets the window. A
+ * Vulkan ICD that presents via VK_KHR_display direct mode (libmali — it offers no
+ * VK_EXT_acquire_drm_display / lease, so it cannot take a display from another
+ * master) then enumerates ZERO displays ("Vulkan can't find any displays") because
+ * the master is held elsewhere. Dropping SDL's master lets the Vulkan driver
+ * acquire the display. SDL keeps its fd open and still services input (evdev needs
+ * no master); for a fullscreen handheld game that hands the screen to Vulkan this
+ * is the intended ownership transfer. No-op (and harmless) off KMSDRM.
+ *
+ * Returns the ioctl rc (0 = master dropped), or -1 if not a KMSDRM window. */
+int sdl_window_kmsdrm_drop_master(void* window)
+{
+	(void)window;
+#ifndef DRM_IOCTL_DROP_MASTER
+#define DRM_IOCTL_DROP_MASTER 0x641f   /* _IO('d', 0x1f) */
+#endif
+	/* Find the DRM master fd by inspecting our open fds rather than via SDL's
+	 * WMinfo struct (whose KMSDRM layout is ABI-fragile and silently mis-read on
+	 * the last attempt): scan /proc/self/fd for /dev/dri/card* and drop master on
+	 * each. The fd SDL set master on succeeds; the rest return EINVAL/EACCES and are
+	 * ignored. */
+	DIR *d = opendir("/proc/self/fd");
+	if (!d) {
+		fprintf(stderr, "sdl_window_shim: drop_master: opendir(/proc/self/fd) failed: %s\n",
+		        strerror(errno));
+		return -1;
+	}
+	struct dirent *e;
+	int dropped = 0, dri_seen = 0;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] < '0' || e->d_name[0] > '9')
+			continue;
+		char path[64], target[256];
+		snprintf(path, sizeof path, "/proc/self/fd/%s", e->d_name);
+		ssize_t n = readlink(path, target, sizeof target - 1);
+		if (n <= 0)
+			continue;
+		target[n] = '\0';
+		if (strncmp(target, "/dev/dri/", 9) != 0)
+			continue;
+		dri_seen++;
+		int fd = atoi(e->d_name);
+		int is_card = (strncmp(target, "/dev/dri/card", 13) == 0);
+		if (!is_card) {
+			fprintf(stderr, "sdl_window_shim: drop_master: fd=%d %s (render node, skip)\n",
+			        fd, target);
+			continue;
+		}
+		int rc = ioctl(fd, DRM_IOCTL_DROP_MASTER, 0);
+		fprintf(stderr, "sdl_window_shim: drop_master: fd=%d %s rc=%d (%s)\n",
+		        fd, target, rc, rc == 0 ? "was master -> dropped" : strerror(errno));
+		if (rc == 0)
+			dropped++;
+	}
+	closedir(d);
+	if (!dri_seen)
+		fprintf(stderr, "sdl_window_shim: drop_master: NO /dev/dri/* fd open in this process "
+		        "(SDL not on KMSDRM, or the display master is held by another process)\n");
+	else if (!dropped)
+		fprintf(stderr, "sdl_window_shim: drop_master: %d dri fd(s) but none held master\n", dri_seen);
+	return dropped ? 0 : -1;
+}
 
 static void resolve_sdl_funcs(void)
 {
@@ -152,23 +234,42 @@ void* sdl_create_window_wrapper(const char* title, int x, int y, int w, int h, u
 		stripped_metal = 1;
 		fprintf(stderr, "sdl_window_shim: stripped SDL_WINDOW_METAL (no Metal on Linux)\n");
 	}
-	/* On KMSDRM, fullscreen is the only valid mode for EGL surface creation. */
+	/* On KMSDRM, fullscreen is the only valid mode for EGL/Vulkan surface creation. */
 	if (sdl_window_is_kmsdrm_env()) {
 		flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 		fprintf(stderr, "sdl_window_shim: KMSDRM detected, forcing fullscreen\n");
-		/* A Metal-origin window is a GPU window; on Linux that GPU path is GLES.
-		 * On KMSDRM there is no native window handle to build our own EGL surface
-		 * from (SDL holds DRM master and keeps the GBM surface internal), so SDL
-		 * must own the GL context. Mark the window SDL_WINDOW_OPENGL and request a
-		 * GLES3 config so SDL_GL_CreateContext can bind it (see the Gothic GLES
-		 * backend's KMSDRM path in gl_context.cpp). On Wayland/X11 we instead drive
-		 * EGL from the native handle, so this is gated to KMSDRM only. */
-		if (stripped_metal) {
+	}
+	/* For a Metal-origin window, pick the GPU flag matching the active backend.
+	 * SDL2 rejects SDL_WINDOW_OPENGL|SDL_WINDOW_VULKAN together.
+	 * GLES: on KMSDRM SDL must own the GBM/EGL context (SDL_WINDOW_OPENGL +
+	 *       SDL_GL_CreateContext); on Wayland/X11 we drive EGL from the native
+	 *       handle and don't need any SDL GPU flag.
+	 * Vulkan: SDL_Vulkan_CreateSurface requires SDL_WINDOW_VULKAN on all backends
+	 *         (KMSDRM uses VK_KHR_display under the hood, Wayland uses wl_surface). */
+	if (stripped_metal) {
+		/* Match the window's GPU flag to the render backend. The loader pushes the
+		 * choice (sdl_window_set_vulkan) before this point, using the SAME memoized
+		 * decision the renderer's select_backend() makes — so a default/auto-prefer
+		 * run that lands on Vulkan still gets SDL_WINDOW_VULKAN here (the previous
+		 * code only checked GOTHIC_BACKEND==vulkan and mis-flagged the auto case as
+		 * GLES, breaking SDL_Vulkan_CreateSurface). If no hint was pushed (non-Gothic
+		 * override lib), fall back to the env var. */
+		int want_vulkan = backend_is_vulkan;
+		if (want_vulkan < 0) {
+			const char *want_backend = getenv("GOTHIC_BACKEND");
+			want_vulkan = want_backend && strcmp(want_backend, "vulkan") == 0;
+		}
+		if (want_vulkan) {
+			flags |= SDL_WINDOW_VULKAN;
+			fprintf(stderr, "sdl_window_shim: render backend = Vulkan → SDL_WINDOW_VULKAN\n");
+		} else if (sdl_window_is_kmsdrm_env()) {
+			/* GLES on KMSDRM: SDL must own the GBM/EGL surface. */
 			flags |= SDL_WINDOW_OPENGL;
 			request_gles3_window_config();
 			fprintf(stderr, "sdl_window_shim: KMSDRM + Metal-origin window → added "
 			        "SDL_WINDOW_OPENGL (SDL owns GBM/EGL)\n");
 		}
+		/* GLES on Wayland/X11: no SDL GPU flag needed; EGL from native handle. */
 	}
 	/* Keep ALLOW_HIGHDPI — the game was built for Retina displays and handles
 	 * HiDPI itself. Stripping it causes a drawable/logical size mismatch on
