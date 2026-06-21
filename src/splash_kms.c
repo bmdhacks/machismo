@@ -29,8 +29,13 @@
  * those devices. With dlopen, an absent libdrm just no-ops the splash.
  *
  * Fail-soft throughout: any failure logs and returns <0; the game proceeds with
- * the old black screen. Skipped under X11/Wayland (a desktop dev host, where the
- * compositor owns the display and there is nothing to splash over).
+ * the old black screen. On a LIVE desktop compositor the splash skips itself
+ * because the DRM master is unavailable (we never steal it). Note we do NOT gate
+ * on DISPLAY/WAYLAND_DISPLAY being merely *set*: a frontend (e.g. EmulationStation)
+ * that exports DISPLAY then quits its X server before launching a KMSDRM port
+ * leaves DISPLAY set but DEAD — the panel is in fact free, so the splash must (and
+ * now does) show. The authoritative test is "can we become DRM master?", not the
+ * env var. See the SET_MASTER gate in machismo_splash_show.
  */
 
 #ifdef HAVE_LIBDRM
@@ -145,9 +150,6 @@ static struct {
 
 int machismo_splash_show(const char *png_path)
 {
-	/* Desktop dev host: a compositor owns the display, nothing to splash over. */
-	if (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY"))
-		return -1;
 	if (!png_path || !*png_path)
 		return -1;
 	/* Resolve libdrm before touching anything; no-op the splash if it's absent. */
@@ -165,15 +167,6 @@ int machismo_splash_show(const char *png_path)
 	uint32_t           fb_id   = 0;
 	struct drm_mode_create_dumb creq;
 	memset(&creq, 0, sizeof creq);   /* creq.handle stays 0 until CREATE_DUMB */
-
-	/* Decode the PNG as RGBA8. */
-	int iw = 0, ih = 0, ic = 0;
-	img = stbi_load(png_path, &iw, &ih, &ic, 4);
-	if (!img) {
-		fprintf(stderr, "machismo: splash: cannot decode %s: %s\n",
-		        png_path, stbi_failure_reason());
-		return -1;
-	}
 
 	/* Find a DRM card with a connected output. */
 	for (int c = 0; c < 8 && fd < 0; c++) {
@@ -229,9 +222,33 @@ int machismo_splash_show(const char *png_path)
 		goto fail;
 	}
 
-	/* Become master to modeset (root on the handheld; granted to the sole opener
-	 * on a free console otherwise). Best-effort — failure surfaces at SetCrtc. */
-	splash_set_master(fd);
+	/* Become DRM master to modeset. On a handheld port launch the panel is free so
+	 * this succeeds (root, or the sole opener of a free console). A LIVE desktop
+	 * compositor already holds the master, so SET_MASTER returns EBUSY/EACCES; when
+	 * a display-server env var is also present we take that as authoritative and
+	 * skip — rather than risk stealing the panel (as root, SET_MASTER could succeed
+	 * and stomp the desktop). The case the old unconditional getenv() skip got wrong:
+	 * a frontend that EXPORTS DISPLAY then QUITS its X server before launching this
+	 * KMSDRM port leaves DISPLAY set but DEAD — there SET_MASTER SUCCEEDS, so we fall
+	 * through and the splash shows. A pure-console handheld (no env var set) keeps the
+	 * old best-effort behaviour even if SET_MASTER reports failure: the sole opener is
+	 * granted master implicitly and a genuine failure still surfaces at SetCrtc. */
+	if (splash_set_master(fd) != 0 && (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY"))) {
+		fprintf(stderr, "machismo: splash: DRM master unavailable and a display "
+		        "server is set (DISPLAY/WAYLAND_DISPLAY) — a live compositor owns "
+		        "the panel; no splash\n");
+		goto fail;
+	}
+
+	/* Decode the PNG as RGBA8. Done AFTER the master gate so a live desktop / dev
+	 * host bails out above without spending any work decoding an image it can't show. */
+	int iw = 0, ih = 0, ic = 0;
+	img = stbi_load(png_path, &iw, &ih, &ic, 4);
+	if (!img) {
+		fprintf(stderr, "machismo: splash: cannot decode %s: %s\n",
+		        png_path, stbi_failure_reason());
+		goto fail;
+	}
 
 	/* Allocate + map a dumb buffer at panel resolution (XRGB8888). */
 	creq.width = W;
