@@ -35,6 +35,9 @@ userdata/
 test_lse_emul
 test_necrolevel_rng
 
+# Claude agent instruction files — kept local, never tracked (matches in any dir)
+CLAUDE.md
+
 # CMake compiler detection artifacts
 cinctest.c
 clang_major.c
